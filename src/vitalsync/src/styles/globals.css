@@ -1,0 +1,110 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── VitalSync Global Styles ── */
+
+@layer base {
+  body {
+    @apply bg-midnight text-slate-100 font-sans antialiased;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Monospace numbers for all metric displays */
+  .font-metric {
+    @apply font-mono tabular-nums;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* ── Glassmorphism card ── */
+  .glass-card {
+    @apply bg-slate-800/70 backdrop-blur-xl rounded-2xl border border-slate-700/50;
+  }
+
+  .glass-card-hover {
+    @apply glass-card transition-all duration-200 hover:border-slate-600/50 hover:bg-slate-800/80;
+  }
+
+  /* ── Gradient CTA button ── */
+  .btn-cta {
+    @apply bg-gradient-to-r from-emerald-500 to-cyan-400 text-midnight font-semibold 
+           rounded-xl px-6 py-3 transition-all duration-200 
+           hover:from-emerald-400 hover:to-cyan-300 hover:shadow-lg hover:shadow-emerald-500/20
+           active:scale-[0.98];
+  }
+
+  .btn-cta-sm {
+    @apply bg-gradient-to-r from-emerald-500 to-cyan-400 text-midnight font-medium 
+           rounded-lg px-4 py-2 text-sm transition-all duration-200
+           hover:from-emerald-400 hover:to-cyan-300
+           active:scale-[0.98];
+  }
+
+  /* ── Secondary button ── */
+  .btn-secondary {
+    @apply bg-slate-700 text-slate-200 font-medium rounded-xl px-6 py-3
+           border border-slate-600 transition-all duration-200
+           hover:bg-slate-600 hover:border-slate-500
+           active:scale-[0.98];
+  }
+
+  /* ── Metric display ── */
+  .metric-hero {
+    @apply text-metric-hero font-mono tabular-nums text-white;
+  }
+
+  .metric-lg {
+    @apply text-metric-lg font-mono tabular-nums text-white;
+  }
+
+  .metric-md {
+    @apply text-metric-md font-mono tabular-nums text-white;
+  }
+
+  /* ── Tab bar ── */
+  .tab-active {
+    @apply text-emerald-400 border-b-2 border-emerald-400;
+  }
+
+  .tab-inactive {
+    @apply text-slate-400 hover:text-slate-300 transition-colors;
+  }
+
+  /* ── Input fields ── */
+  .input-field {
+    @apply bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm
+           placeholder-slate-400 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500
+           transition-colors;
+  }
+
+  /* ── Action prompt card ── */
+  .prompt-card {
+    @apply glass-card p-4 flex items-center gap-3 animate-fade-in;
+  }
+}
+
+/* ── Scrollbar styling ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-slate-600 rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-slate-500;
+}
+
+/* ── Recharts overrides ── */
+.recharts-cartesian-axis-tick-value {
+  @apply fill-slate-400 text-xs;
+}
+.recharts-tooltip-wrapper {
+  @apply !outline-none;
+}

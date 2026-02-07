@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+functions/python/venv/
+functions/python/__pycache__/
+
+# Build
+dist/
+.vite/
+
+# Firebase
+.firebase/
+
+# Env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
