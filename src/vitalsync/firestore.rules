@@ -8,19 +8,12 @@ service cloud.firestore {
     // Garmin tokens are NEVER readable by clients
     // ══════════════════════════════════════════════════════
 
-    // ── USER SETTINGS ──
-    match /users/{uid}/settings {
-      allow read: if request.auth != null && request.auth.uid == uid
-                  // Block client from reading encrypted Garmin session
-                  && !('garthSession' in resource.data.garmin)
-                  || (request.auth.uid == uid && !resource.data.keys().hasAny(['garmin.garthSession']));
-      
-      // Simpler approach: allow read but use field-level security via a Cloud Function
-      // that strips sensitive fields before returning
+    // ── USER DOCUMENT (profile + settings) ──
+    match /users/{uid} {
       allow read: if request.auth != null && request.auth.uid == uid;
-      
+
       allow create: if request.auth != null && request.auth.uid == uid;
-      
+
       allow update: if request.auth != null && request.auth.uid == uid
                     // Prevent client from writing to garmin token fields
                     && !request.resource.data.diff(resource.data).affectedKeys()
@@ -85,13 +78,13 @@ service cloud.firestore {
     }
 
     // ── CYCLING PROFILE ──
-    match /users/{uid}/cyclingProfile {
+    match /users/{uid}/cyclingProfile/{docId} {
       allow read: if request.auth != null && request.auth.uid == uid;
       allow write: if false;
     }
 
     // ── LIFETIME STATS ──
-    match /users/{uid}/lifetimeStats {
+    match /users/{uid}/lifetimeStats/{docId} {
       allow read: if request.auth != null && request.auth.uid == uid;
       allow write: if false;
     }

@@ -1,6 +1,8 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
+import ErrorBoundary from '@/components/ErrorBoundary';
 import LoginPage from '@/pages/LoginPage';
+import OnboardingPage from '@/pages/OnboardingPage';
 import AppShell from '@/components/AppShell';
 import '@/styles/globals.css';
 
@@ -16,15 +18,34 @@ function ProtectedRoute({ children }) {
   return isAuthenticated ? children : <Navigate to="/login" replace />;
 }
 
+function OnboardingGuard({ children }) {
+  const { userSettings, loading } = useAuth();
+  if (loading) return null;
+  if (userSettings && !userSettings.onboardingComplete) {
+    return <Navigate to="/onboarding" replace />;
+  }
+  return children;
+}
+
 function AppRoutes() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route
+        path="/onboarding"
+        element={
+          <ProtectedRoute>
+            <OnboardingPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
         path="/*"
         element={
           <ProtectedRoute>
-            <AppShell />
+            <OnboardingGuard>
+              <AppShell />
+            </OnboardingGuard>
           </ProtectedRoute>
         }
       />
@@ -34,10 +55,12 @@ function AppRoutes() {
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <AuthProvider>
-        <AppRoutes />
-      </AuthProvider>
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <AuthProvider>
+          <AppRoutes />
+        </AuthProvider>
+      </BrowserRouter>
+    </ErrorBoundary>
   );
 }

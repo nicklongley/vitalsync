@@ -1,18 +1,7 @@
-import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 
 export default function LoginPage() {
   const { signInWithGoogle, error } = useAuth();
-  const navigate = useNavigate();
-
-  async function handleSignIn() {
-    try {
-      const result = await signInWithGoogle();
-      navigate(result.isNewUser ? '/onboarding' : '/');
-    } catch (err) {
-      console.error('Sign-in failed:', err);
-    }
-  }
 
   return (
     <div className="min-h-screen bg-midnight flex flex-col items-center justify-center px-6">
@@ -31,7 +20,7 @@ export default function LoginPage() {
         </p>
 
         <button
-          onClick={handleSignIn}
+          onClick={signInWithGoogle}
           className="w-full flex items-center justify-center gap-3 bg-white text-slate-800 font-medium
                      rounded-xl px-6 py-3.5 transition-all duration-200
                      hover:bg-slate-100 hover:shadow-lg active:scale-[0.98]"

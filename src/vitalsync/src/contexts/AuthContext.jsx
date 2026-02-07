@@ -5,7 +5,6 @@
 
 import { createContext, useContext, useState, useEffect } from 'react';
 import {
-  signInWithPopup,
   signInWithRedirect,
   getRedirectResult,
   signOut as firebaseSignOut,
@@ -24,11 +23,11 @@ export function AuthProvider({ children }) {
 
   // Helper: load or create user settings after sign-in
   async function loadOrCreateSettings(firebaseUser) {
-    const settingsRef = doc(db, 'users', firebaseUser.uid, 'settings');
-    const settingsSnap = await getDoc(settingsRef);
+    const userRef = doc(db, 'users', firebaseUser.uid);
+    const userSnap = await getDoc(userRef);
 
-    if (settingsSnap.exists()) {
-      setUserSettings(settingsSnap.data());
+    if (userSnap.exists()) {
+      setUserSettings(userSnap.data());
       return { isNewUser: false };
     }
 
@@ -76,12 +75,12 @@ export function AuthProvider({ children }) {
       },
     };
 
-    await setDoc(settingsRef, initialSettings);
+    await setDoc(userRef, initialSettings);
     setUserSettings(initialSettings);
     return { isNewUser: true };
   }
 
-  // Handle redirect result (for environments where popups are blocked)
+  // Handle redirect result (Google Sign-In uses redirect flow)
   useEffect(() => {
     getRedirectResult(auth).then((result) => {
       if (result?.user) {
@@ -89,6 +88,7 @@ export function AuthProvider({ children }) {
       }
     }).catch((err) => {
       console.error('Redirect sign-in error:', err);
+      setError(err.message);
     });
   }, []);
 
@@ -98,10 +98,10 @@ export function AuthProvider({ children }) {
       if (firebaseUser) {
         setUser(firebaseUser);
         try {
-          const settingsRef = doc(db, 'users', firebaseUser.uid, 'settings');
-          const settingsSnap = await getDoc(settingsRef);
-          if (settingsSnap.exists()) {
-            setUserSettings(settingsSnap.data());
+          const userRef = doc(db, 'users', firebaseUser.uid);
+          const userSnap = await getDoc(userRef);
+          if (userSnap.exists()) {
+            setUserSettings(userSnap.data());
           }
         } catch (err) {
           console.error('Error loading user settings:', err);
@@ -116,20 +116,14 @@ export function AuthProvider({ children }) {
     return () => unsubscribe();
   }, []);
 
-  // Google Sign-In (popup with redirect fallback)
+  // Google Sign-In (redirect flow — required for Firebase Hosting COOP)
   async function signInWithGoogle() {
     setError(null);
     try {
-      const result = await signInWithPopup(auth, googleProvider);
-      return await loadOrCreateSettings(result.user);
+      await signInWithRedirect(auth, googleProvider);
     } catch (err) {
-      // If popup blocked (common in iframes/Studio), fall back to redirect
-      if (err.code === 'auth/popup-blocked' || err.code === 'auth/cancelled-popup-request') {
-        await signInWithRedirect(auth, googleProvider);
-        return { isNewUser: false }; // Will resolve after redirect
-      }
+      console.error('Sign-in failed:', err);
       setError(err.message);
-      throw err;
     }
   }
 

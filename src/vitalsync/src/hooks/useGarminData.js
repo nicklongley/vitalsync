@@ -6,7 +6,7 @@
 import { useState, useEffect } from 'react';
 import {
   doc, collection, query, orderBy, limit, onSnapshot,
-  where, getDocs,
+  where, getDoc, addDoc, deleteDoc, updateDoc, serverTimestamp,
 } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '@/lib/firebase';
@@ -47,24 +47,14 @@ export function useGarminWeek() {
     async function fetchWeek() {
       const days = [];
       for (let i = 6; i >= 0; i--) {
-        const dateStr = format(subDays(new Date(), i), 'yyyy-MM-dd');
-        days.push(dateStr);
+        days.push(format(subDays(new Date(), i), 'yyyy-MM-dd'));
       }
 
-      const results = [];
-      for (const dateStr of days) {
-        const ref = doc(db, 'users', user.uid, 'garminDailies', dateStr);
-        const snap = await getDocs(query(collection(db, 'users', user.uid, 'garminDailies')));
-        // Use individual doc gets for week view
-      }
-
-      // Simplified: fetch each day individually
       const weekData = await Promise.all(
         days.map(async (dateStr) => {
           const ref = doc(db, 'users', user.uid, 'garminDailies', dateStr);
-          // onSnapshot would be wasteful for 7 docs, so we'll rely on
-          // the scheduled sync to keep data fresh
-          return { date: dateStr };
+          const snap = await getDoc(ref);
+          return snap.exists() ? { date: dateStr, ...snap.data() } : { date: dateStr };
         })
       );
 
@@ -194,6 +184,34 @@ export function useHealthLog(type = null, count = 20) {
   }, [user, type, count]);
 
   return { entries, loading };
+}
+
+// ── Health log mutations ──
+export function useHealthLogMutations() {
+  const { user } = useAuth();
+
+  async function createEntry(type, date, data) {
+    if (!user) throw new Error('Must be signed in');
+    const ref = collection(db, 'users', user.uid, 'healthLog');
+    return addDoc(ref, {
+      type,
+      date,
+      data,
+      enteredAt: serverTimestamp(),
+    });
+  }
+
+  async function deleteEntry(entryId) {
+    if (!user) throw new Error('Must be signed in');
+    return deleteDoc(doc(db, 'users', user.uid, 'healthLog', entryId));
+  }
+
+  async function updateEntry(entryId, updates) {
+    if (!user) throw new Error('Must be signed in');
+    return updateDoc(doc(db, 'users', user.uid, 'healthLog', entryId), updates);
+  }
+
+  return { createEntry, deleteEntry, updateEntry };
 }
 
 // ── Activity stats (aggregated periods) ──
