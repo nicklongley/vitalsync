@@ -70,7 +70,10 @@ def _restore_client(uid: str) -> Garmin:
         )
 
     session_json = decrypt(garmin_cfg['garthSession'])
-    garth.resume(session_json)
+
+    # garth.resume() expects a directory path, not a string.
+    # Use garth.client.loads() to restore from a JSON string.
+    garth.client.loads(session_json)
 
     client = Garmin()
     client.garth = garth.client
