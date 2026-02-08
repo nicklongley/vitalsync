@@ -1,258 +1,243 @@
-import { useState } from 'react';
-import { useRecentActivities, useActivityStats } from '@/hooks/useGarminData';
-import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
+// ══════════════════════════════════════════════════════
+// VITALSYNC — Training Tab
+// AI weekly training plan display + generation
+// ══════════════════════════════════════════════════════
 
-const ACTIVITY_COLORS = {
-  running: '#10B981',
-  cycling: '#06B6D4',
-  swimming: '#8B5CF6',
-  strength_training: '#F59E0B',
-  walking: '#6366F1',
-  hiking: '#EC4899',
-  yoga: '#14B8A6',
-  other: '#94A3B8',
-};
+import { useState, useEffect } from 'react';
+import { collection, query, orderBy, limit, onSnapshot, doc, updateDoc } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
+import { db, functions } from '@/lib/firebase';
+import { useAuth } from '@/contexts/AuthContext';
 
-function getActivityColor(name) {
-  const key = (name || '').toLowerCase().replace(/\s+/g, '_');
-  for (const [k, v] of Object.entries(ACTIVITY_COLORS)) {
-    if (key.includes(k)) return v;
-  }
-  return ACTIVITY_COLORS.other;
-}
-
-function formatDuration(seconds) {
-  if (!seconds) return '--';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.round((seconds % 3600) / 60);
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-
-function ActivityCard({ activity }) {
-  const name = activity.activityName || activity.activityType?.typeKey || 'Activity';
-  const duration = activity.duration || activity.movingDuration || 0;
-  const distance = activity.distance ? (activity.distance / 1000).toFixed(1) : null;
-  const calories = activity.calories || activity.activeKilocalories || null;
-  const date = activity.startTimeLocal?.slice(0, 10) || activity.date || '';
-  const color = getActivityColor(name);
-  const avgHR = activity.averageHR || activity.avgHr || null;
-  const avgPower = activity.avgPower || null;
-
-  return (
-    <div className="glass-card p-4">
-      <div className="flex items-start gap-3">
-        <div
-          className="w-10 h-10 rounded-xl flex items-center justify-center text-xs font-bold flex-shrink-0"
-          style={{ backgroundColor: `${color}15`, color }}
-        >
-          {name.slice(0, 2).toUpperCase()}
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center justify-between">
-            <p className="text-white text-sm font-medium truncate">{name}</p>
-            <p className="text-slate-500 text-xs flex-shrink-0 ml-2">{date}</p>
-          </div>
-          <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1">
-            {duration > 0 && (
-              <span className="text-slate-400 text-xs">{formatDuration(duration)}</span>
-            )}
-            {distance && (
-              <span className="text-slate-400 text-xs">{distance} km</span>
-            )}
-            {calories && (
-              <span className="text-slate-400 text-xs">{calories} kcal</span>
-            )}
-            {avgHR && (
-              <span className="text-slate-400 text-xs">{avgHR} bpm</span>
-            )}
-            {avgPower && (
-              <span className="text-slate-400 text-xs">{avgPower} W</span>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function WeeklyStatsChart({ stats }) {
-  if (!stats || stats.length === 0) return null;
-
-  const chartData = [...stats].reverse().map((s) => ({
-    label: s.periodStart?.slice(5, 10) || s.id?.slice(0, 10) || '',
-    hours: s.totalDurationSeconds ? +(s.totalDurationSeconds / 3600).toFixed(1) : 0,
-    distance: s.totalDistanceMeters ? +(s.totalDistanceMeters / 1000).toFixed(0) : 0,
-    activities: s.activityCount || 0,
-  }));
-
-  return (
-    <div className="glass-card p-4">
-      <p className="text-slate-400 text-xs mb-3">Weekly Training Volume</p>
-      <ResponsiveContainer width="100%" height={140}>
-        <BarChart data={chartData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#1E293B" />
-          <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#64748B' }} axisLine={false} tickLine={false} />
-          <YAxis tick={{ fontSize: 10, fill: '#64748B' }} axisLine={false} tickLine={false} />
-          <Tooltip
-            contentStyle={{ background: '#1E293B', border: '1px solid #334155', borderRadius: '8px', fontSize: '11px' }}
-            labelStyle={{ color: '#94A3B8' }}
-          />
-          <Bar dataKey="hours" fill="#10B981" radius={[4, 4, 0, 0]} name="Hours" />
-        </BarChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
-function ActivitySummary({ activities }) {
-  const byType = {};
-  for (const act of activities) {
-    const name = act.activityName || act.activityType?.typeKey || 'Other';
-    if (!byType[name]) byType[name] = { count: 0, duration: 0, distance: 0 };
-    byType[name].count += 1;
-    byType[name].duration += (act.duration || act.movingDuration || 0);
-    byType[name].distance += (act.distance || 0);
-  }
-
-  const sorted = Object.entries(byType).sort((a, b) => b[1].duration - a[1].duration);
-
-  if (sorted.length === 0) return null;
-
-  return (
-    <div className="glass-card p-4">
-      <p className="text-slate-400 text-xs mb-3">Activity Breakdown</p>
-      <div className="space-y-2">
-        {sorted.map(([name, data]) => {
-          const color = getActivityColor(name);
-          return (
-            <div key={name} className="flex items-center gap-3">
-              <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: color }} />
-              <span className="text-white text-xs flex-1 truncate">{name}</span>
-              <span className="text-slate-400 text-xs">{data.count}x</span>
-              <span className="text-slate-500 text-xs w-14 text-right">{formatDuration(data.duration)}</span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
+const DAY_LABELS = { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday' };
 
 export default function TrainingTab() {
-  const [view, setView] = useState('activities');
-  const { activities, loading: activitiesLoading } = useRecentActivities(30);
-  const { stats, loading: statsLoading } = useActivityStats('week', 12);
+  const { user } = useAuth();
+  const [plans, setPlans] = useState([]);
+  const [loadingPlans, setLoadingPlans] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState('');
 
-  const loading = activitiesLoading || statsLoading;
+  // Listen to training plans
+  useEffect(() => {
+    if (!user) return;
 
-  if (loading) {
-    return (
-      <div className="space-y-4">
-        {[...Array(4)].map((_, i) => (
-          <div key={i} className="glass-card h-24 animate-pulse" />
-        ))}
-      </div>
+    const q = query(
+      collection(db, 'users', user.uid, 'trainingPlans'),
+      orderBy('createdAt', 'desc'),
+      limit(4)
     );
-  }
 
-  // Group activities by month
-  const grouped = {};
-  for (const act of activities) {
-    const date = act.startTimeLocal?.slice(0, 7) || act.date?.slice(0, 7) || 'Unknown';
-    if (!grouped[date]) grouped[date] = [];
-    grouped[date].push(act);
-  }
-
-  const totalThisWeek = activities
-    .filter((a) => {
-      const d = a.startTimeLocal || a.date;
-      if (!d) return false;
-      const actDate = new Date(d);
-      const now = new Date();
-      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-      return actDate >= weekAgo;
+    const unsub = onSnapshot(q, (snap) => {
+      setPlans(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      setLoadingPlans(false);
+    }, (err) => {
+      console.error('Error loading training plans:', err);
+      setLoadingPlans(false);
     });
 
-  const weekDuration = totalThisWeek.reduce((sum, a) => sum + (a.duration || a.movingDuration || 0), 0);
-  const weekDistance = totalThisWeek.reduce((sum, a) => sum + (a.distance || 0), 0);
+    return () => unsub();
+  }, [user]);
+
+  async function generatePlan() {
+    setGenerating(true);
+    setError('');
+    try {
+      const fn = httpsCallable(functions, 'ai_weekly_plan');
+      await fn();
+    } catch (err) {
+      console.error('Plan generation failed:', err);
+      setError(err.message || 'Failed to generate plan.');
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function toggleSession(planId, sessionIndex, completed) {
+    try {
+      const plan = plans.find(p => p.id === planId);
+      if (!plan) return;
+      const updatedSessions = [...plan.sessions];
+      updatedSessions[sessionIndex] = { ...updatedSessions[sessionIndex], completed };
+      await updateDoc(doc(db, 'users', user.uid, 'trainingPlans', planId), {
+        sessions: updatedSessions,
+      });
+    } catch (err) {
+      console.error('Failed to update session:', err);
+    }
+  }
+
+  const currentPlan = plans[0];
+  const pastPlans = plans.slice(1);
 
   return (
     <div className="space-y-4">
-      {/* View toggle */}
-      <div className="flex gap-2">
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-bold text-white">Training Plan</h2>
         <button
-          onClick={() => setView('activities')}
-          className={`text-xs rounded-lg px-3 py-1.5 border transition-colors ${
-            view === 'activities'
-              ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400'
-              : 'border-slate-700 text-slate-400'
-          }`}
+          onClick={generatePlan}
+          disabled={generating}
+          className="px-4 py-2 rounded-xl text-xs font-medium bg-emerald-600/20 border border-emerald-700/50
+                     text-emerald-400 hover:bg-emerald-600/30 disabled:opacity-50 transition-colors"
         >
-          Activities
-        </button>
-        <button
-          onClick={() => setView('stats')}
-          className={`text-xs rounded-lg px-3 py-1.5 border transition-colors ${
-            view === 'stats'
-              ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400'
-              : 'border-slate-700 text-slate-400'
-          }`}
-        >
-          Stats
+          {generating ? (
+            <span className="flex items-center gap-2">
+              <span className="w-3 h-3 rounded-full border-2 border-emerald-400 border-t-transparent animate-spin" />
+              Generating...
+            </span>
+          ) : 'Generate Plan'}
         </button>
       </div>
 
-      {/* This Week Summary */}
-      <div className="glass-card p-4">
-        <p className="text-slate-400 text-xs mb-2">This Week</p>
-        <div className="grid grid-cols-3 gap-3">
-          <div>
-            <p className="text-white text-lg font-semibold">{totalThisWeek.length}</p>
-            <p className="text-slate-500 text-[10px]">Activities</p>
-          </div>
-          <div>
-            <p className="text-emerald-400 text-lg font-semibold">{formatDuration(weekDuration)}</p>
-            <p className="text-slate-500 text-[10px]">Duration</p>
-          </div>
-          <div>
-            <p className="text-cyan-400 text-lg font-semibold">
-              {weekDistance > 0 ? `${(weekDistance / 1000).toFixed(1)}` : '--'}
-            </p>
-            <p className="text-slate-500 text-[10px]">Km</p>
-          </div>
+      {error && <p className="text-xs text-rose-400">{error}</p>}
+
+      {loadingPlans ? (
+        <div className="flex justify-center py-8">
+          <div className="w-8 h-8 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin" />
         </div>
-      </div>
-
-      {view === 'stats' ? (
+      ) : currentPlan ? (
         <>
-          <WeeklyStatsChart stats={stats} />
-          <ActivitySummary activities={activities} />
-        </>
-      ) : (
-        <>
-          {activities.length === 0 ? (
-            <div className="glass-card p-6 text-center">
-              <p className="text-slate-400 text-sm">No activities yet</p>
-              <p className="text-slate-500 text-xs mt-1">
-                Connect your Garmin in Settings to sync activity data.
-              </p>
+          {/* Current plan header */}
+          <div className="glass-card p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <p className="text-sm font-semibold text-white">This Week's Plan</p>
+                <p className="text-[10px] text-slate-500">
+                  {currentPlan.weekStartDate} to {currentPlan.weekEndDate}
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs text-slate-400">Planned</p>
+                <p className="text-lg font-mono font-bold text-emerald-400">
+                  {currentPlan.totalPlannedMinutes ? `${Math.round(currentPlan.totalPlannedMinutes / 60)}h` : '--'}
+                </p>
+              </div>
             </div>
-          ) : (
-            Object.entries(grouped).map(([month, acts]) => (
-              <div key={month}>
-                <h3 className="text-slate-400 text-xs font-medium mb-2 uppercase tracking-wider">
-                  {month}
-                </h3>
-                <div className="space-y-2">
-                  {acts.map((act) => (
-                    <ActivityCard key={act.id} activity={act} />
-                  ))}
+            {currentPlan.summary && (
+              <p className="text-xs text-slate-300 leading-relaxed">{currentPlan.summary}</p>
+            )}
+            {currentPlan.focusAreas?.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mt-2">
+                {currentPlan.focusAreas.map((area, i) => (
+                  <span key={i} className="px-2 py-0.5 rounded-full text-[10px] bg-cyan-900/30 text-cyan-400 border border-cyan-800/40">
+                    {area}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Sessions */}
+          <div className="space-y-2">
+            {(currentPlan.sessions || []).map((session, i) => (
+              <div key={i} className={`glass-card p-4 transition-all ${session.completed ? 'opacity-60' : ''}`}>
+                <div className="flex items-start gap-3">
+                  <button
+                    onClick={() => toggleSession(currentPlan.id, i, !session.completed)}
+                    className={`w-6 h-6 rounded-lg border-2 flex-shrink-0 flex items-center justify-center mt-0.5 transition-colors ${
+                      session.completed
+                        ? 'bg-emerald-600 border-emerald-600 text-white'
+                        : 'border-slate-600 hover:border-emerald-600'
+                    }`}
+                  >
+                    {session.completed && '\u2713'}
+                  </button>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm">{getSessionIcon(session.type || session.sport)}</span>
+                      <p className={`text-sm font-medium ${session.completed ? 'text-slate-500 line-through' : 'text-white'}`}>
+                        {session.title || session.name || 'Session'}
+                      </p>
+                    </div>
+                    <p className="text-[10px] text-slate-500 mt-0.5">
+                      {session.day && (DAY_LABELS[session.day.toLowerCase()] || session.day)}
+                      {session.duration && ` \u00B7 ${session.duration}`}
+                      {session.durationMinutes && ` \u00B7 ${session.durationMinutes}min`}
+                      {session.intensity && ` \u00B7 ${session.intensity}`}
+                    </p>
+                    {session.description && (
+                      <p className="text-xs text-slate-400 mt-1">{session.description}</p>
+                    )}
+                  </div>
                 </div>
               </div>
-            ))
+            ))}
+          </div>
+
+          {/* Progress */}
+          {currentPlan.sessions?.length > 0 && (
+            <div className="glass-card p-4">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs text-slate-400">Week Progress</p>
+                <p className="text-xs font-mono text-white">
+                  {currentPlan.sessions.filter(s => s.completed).length}/{currentPlan.sessions.length} sessions
+                </p>
+              </div>
+              <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-emerald-500 to-cyan-400 rounded-full transition-all duration-500"
+                  style={{ width: `${(currentPlan.sessions.filter(s => s.completed).length / currentPlan.sessions.length) * 100}%` }}
+                />
+              </div>
+            </div>
           )}
         </>
+      ) : (
+        /* No plan yet */
+        <div className="glass-card p-8 text-center space-y-3">
+          <p className="text-3xl">{"\uD83C\uDFCB\uFE0F"}</p>
+          <p className="text-sm text-slate-300 font-medium">No training plan yet</p>
+          <p className="text-xs text-slate-500">
+            Generate an AI-powered weekly training plan based on your Garmin data, goals, and availability.
+          </p>
+          <button
+            onClick={generatePlan}
+            disabled={generating}
+            className="px-6 py-2.5 rounded-xl text-sm font-medium bg-emerald-600 text-white
+                       hover:bg-emerald-500 disabled:opacity-50 transition-colors"
+          >
+            {generating ? 'Generating...' : 'Generate My Plan'}
+          </button>
+        </div>
+      )}
+
+      {/* Past plans */}
+      {pastPlans.length > 0 && (
+        <div>
+          <p className="text-xs text-slate-400 uppercase tracking-wider mb-2">Previous Plans</p>
+          <div className="space-y-2">
+            {pastPlans.map(plan => (
+              <div key={plan.id} className="glass-card p-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-xs text-white font-medium">
+                      {plan.weekStartDate} - {plan.weekEndDate}
+                    </p>
+                    <p className="text-[10px] text-slate-500">
+                      {plan.sessions?.filter(s => s.completed).length || 0}/{plan.sessions?.length || 0} completed
+                    </p>
+                  </div>
+                  {plan.totalPlannedMinutes && (
+                    <p className="text-xs font-mono text-slate-400">{Math.round(plan.totalPlannedMinutes / 60)}h</p>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );
+}
+
+function getSessionIcon(type) {
+  const icons = {
+    running: '\uD83C\uDFC3', run: '\uD83C\uDFC3',
+    cycling: '\uD83D\uDEB4', ride: '\uD83D\uDEB4', bike: '\uD83D\uDEB4',
+    swimming: '\uD83C\uDFCA', swim: '\uD83C\uDFCA',
+    strength: '\uD83C\uDFCB\uFE0F', gym: '\uD83C\uDFCB\uFE0F',
+    rest: '\uD83D\uDECC', recovery: '\uD83E\uDDD8',
+    yoga: '\uD83E\uDDD8', stretch: '\uD83E\uDDD8',
+  };
+  return icons[type?.toLowerCase()] || '\uD83C\uDFC3';
 }

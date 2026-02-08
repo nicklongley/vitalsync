@@ -1,16 +1,17 @@
 // ══════════════════════════════════════════════════════
 // VITALSYNC — Authentication Context
-// Google Sign-In only, no email/password
+// Google Sign-In only — popup-first with redirect fallback
 // ══════════════════════════════════════════════════════
 
 import { createContext, useContext, useState, useEffect } from 'react';
 import {
+  signInWithPopup,
   signInWithRedirect,
   getRedirectResult,
   signOut as firebaseSignOut,
   onAuthStateChanged,
 } from 'firebase/auth';
-import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, db, googleProvider } from '@/lib/firebase';
 
 const AuthContext = createContext(null);
@@ -21,109 +22,121 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Helper: load or create user settings after sign-in
-  async function loadOrCreateSettings(firebaseUser) {
-    const userRef = doc(db, 'users', firebaseUser.uid);
-    const userSnap = await getDoc(userRef);
-
-    if (userSnap.exists()) {
-      setUserSettings(userSnap.data());
-      return { isNewUser: false };
-    }
-
-    // Create initial user document
-    const initialSettings = {
-      displayName: firebaseUser.displayName,
-      email: firebaseUser.email,
-      photoURL: firebaseUser.photoURL,
-      createdAt: serverTimestamp(),
-      onboardingComplete: false,
-      garmin: {
-        connected: false,
-        backfillStatus: 'idle',
-        backfillProgress: 0,
-      },
-      goals: {
-        primaryGoal: null,
-        secondaryGoals: [],
-      },
-      availability: {
-        totalHoursPerWeek: 9,
-        maxSingleSessionHours: 3,
-        preferredRestDaysPerWeek: 1,
-        schedule: {
-          mon: { slot: 'morning', durationHours: 1.5 },
-          tue: { slot: 'evening', durationHours: 1.5 },
-          wed: { slot: 'morning', durationHours: 1.5 },
-          thu: { slot: 'rest', durationHours: 0 },
-          fri: { slot: 'evening', durationHours: 1.5 },
-          sat: { slot: 'morning', durationHours: 2 },
-          sun: { slot: 'morning', durationHours: 1.5 },
-        },
-        sportPriorities: [
-          { sport: 'cycling', weeklyHours: 5.25, percentage: 60 },
-          { sport: 'running', weeklyHours: 3, percentage: 33 },
-          { sport: 'strength', weeklyHours: 0.75, percentage: 7 },
-        ],
-      },
-      preferences: {
-        units: 'metric',
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        notificationsEnabled: true,
-        interventionFrequency: 'daily',
-        aiPersonality: 'coach',
-      },
-    };
-
-    await setDoc(userRef, initialSettings);
-    setUserSettings(initialSettings);
-    return { isNewUser: true };
-  }
-
-  // Handle redirect result (Google Sign-In uses redirect flow)
+  // Handle redirect result on mount (fallback for when popup was blocked)
   useEffect(() => {
-    getRedirectResult(auth).then((result) => {
+    getRedirectResult(auth).then(async (result) => {
       if (result?.user) {
-        loadOrCreateSettings(result.user);
+        await _ensureUserSettings(result.user);
       }
     }).catch((err) => {
-      console.error('Redirect sign-in error:', err);
-      setError(err.message);
+      // Ignore common non-error codes
+      if (err.code !== 'auth/popup-closed-by-user' &&
+          err.code !== 'auth/cancelled-popup-request') {
+        console.error('Redirect result error:', err);
+        setError(err.message);
+      }
     });
   }, []);
 
-  // Listen to auth state changes
+  // Listen to auth state changes + real-time user settings
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+    let settingsUnsub = null;
+
+    const authUnsub = onAuthStateChanged(auth, async (firebaseUser) => {
+      // Clean up previous settings listener
+      if (settingsUnsub) {
+        settingsUnsub();
+        settingsUnsub = null;
+      }
+
       if (firebaseUser) {
         setUser(firebaseUser);
+        // Ensure user doc exists when auth state changes
+        // (covers both popup and redirect flows)
         try {
-          const userRef = doc(db, 'users', firebaseUser.uid);
-          const userSnap = await getDoc(userRef);
-          if (userSnap.exists()) {
-            setUserSettings(userSnap.data());
-          }
+          await _ensureUserSettings(firebaseUser);
         } catch (err) {
-          console.error('Error loading user settings:', err);
+          console.error('Error ensuring user settings:', err);
         }
+        // Real-time listener for user settings
+        const settingsRef = doc(db, 'users', firebaseUser.uid);
+        settingsUnsub = onSnapshot(settingsRef, (snap) => {
+          if (snap.exists()) {
+            setUserSettings(snap.data());
+          } else {
+            setUserSettings(null);
+          }
+          setLoading(false);
+        }, (err) => {
+          console.error('Error listening to user settings:', err);
+          setLoading(false);
+        });
       } else {
         setUser(null);
         setUserSettings(null);
+        setLoading(false);
       }
-      setLoading(false);
     });
 
-    return () => unsubscribe();
+    return () => {
+      authUnsub();
+      if (settingsUnsub) settingsUnsub();
+    };
   }, []);
 
-  // Google Sign-In (redirect flow — required for Firebase Hosting COOP)
+  // Ensure user settings doc exists (only write defaults for brand-new users)
+  async function _ensureUserSettings(firebaseUser) {
+    const settingsRef = doc(db, 'users', firebaseUser.uid);
+    // Only update profile fields (name, email, photo) on every login.
+    // Default settings are only written if the fields don't exist yet,
+    // by using merge:true with ONLY the profile fields.
+    // The full defaults (goals, availability, etc.) are set via onboarding.
+    await setDoc(settingsRef, {
+      displayName: firebaseUser.displayName,
+      email: firebaseUser.email,
+      photoURL: firebaseUser.photoURL,
+      lastLoginAt: serverTimestamp(),
+    }, { merge: true });
+  }
+
+  // Google Sign-In: try popup first, fall back to redirect if blocked
   async function signInWithGoogle() {
     setError(null);
     try {
-      await signInWithRedirect(auth, googleProvider);
+      const result = await signInWithPopup(auth, googleProvider);
+      // Popup succeeded — onAuthStateChanged will handle the rest.
+      // The COOP warning about window.closed/window.close is cosmetic
+      // and does not prevent auth from completing.
+      console.log('Popup sign-in completed for:', result?.user?.email);
     } catch (err) {
-      console.error('Sign-in failed:', err);
-      setError(err.message);
+      console.warn('Popup sign-in error:', err.code, err.message);
+      // If popup was blocked or failed due to COOP, fall back to redirect
+      if (
+        err.code === 'auth/popup-blocked' ||
+        err.code === 'auth/popup-closed-by-user' ||
+        err.code === 'auth/cancelled-popup-request'
+      ) {
+        console.log('Falling back to redirect flow');
+        try {
+          await signInWithRedirect(auth, googleProvider);
+        } catch (redirectErr) {
+          setError(redirectErr.message);
+          throw redirectErr;
+        }
+      } else if (err.code === 'auth/internal-error') {
+        // COOP-related errors sometimes manifest as internal-error
+        // but the auth may have actually succeeded — give onAuthStateChanged
+        // a moment to fire
+        console.log('Internal error during popup — checking if auth state changed...');
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        // If we're still not authenticated after 2s, show the error
+        if (!auth.currentUser) {
+          setError('Sign-in failed. Please try again.');
+        }
+      } else {
+        setError(err.message);
+        throw err;
+      }
     }
   }
 

@@ -22,7 +22,7 @@ const firebaseConfig = {
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || 'vitalsync-7e04b',
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || 'vitalsync-7e04b.firebasestorage.app',
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '458815174396',
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || '1:458815174396:web:2833e9593f8fc267bcc979',
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || '1:458815174396:web:31aba05b8c33e23b26be05',
 };
 
 // ── Initialise Firebase ──

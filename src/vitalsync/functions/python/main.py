@@ -69,7 +69,13 @@ def _restore_client(uid: str) -> Garmin:
             message='Garmin not connected',
         )
 
-    session_json = decrypt(garmin_cfg['garthSession'])
+    encrypted_session = garmin_cfg.get('garthSession')
+    if not encrypted_session:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            message='Garmin session expired — please reconnect in Settings',
+        )
+    session_json = decrypt(encrypted_session)
 
     # garth.resume() expects a directory path, not a string.
     # Use garth.client.loads() to restore from a JSON string.
@@ -77,6 +83,11 @@ def _restore_client(uid: str) -> Garmin:
 
     client = Garmin()
     client.garth = garth.client
+
+    # display_name is required for Garmin API URL construction.
+    # Without it, API paths contain '/None/' and return 403.
+    client.display_name = garmin_cfg.get('displayName') or client.get_full_name()
+
     return client
 
 
@@ -94,8 +105,43 @@ def _safe_call(fn, *args, default=None):
     """Call a Garmin API method, returning default on error."""
     try:
         return fn(*args)
-    except Exception:
+    except Exception as e:
+        print(f'API call failed for {fn.__name__}: {e}')
         return default
+
+
+def _sanitize_for_firestore(data, max_depth=10):
+    """
+    Strip deeply nested or oversized data that Firestore rejects.
+    Firestore has a 20-level nesting limit and 1MB doc limit.
+    Also removes large arrays (e.g. per-minute stress values)
+    and converts unsupported types (datetime, etc.) to strings.
+    """
+    if max_depth <= 0:
+        if isinstance(data, (str, int, float, bool)) or data is None:
+            return data
+        return str(data)[:200]
+
+    if isinstance(data, dict):
+        result = {}
+        for k, v in data.items():
+            if isinstance(v, list) and len(v) > 100:
+                result[k] = f'[{len(v)} items omitted]'
+                continue
+            result[k] = _sanitize_for_firestore(v, max_depth - 1)
+        return result
+    elif isinstance(data, list):
+        if len(data) > 100:
+            return f'[{len(data)} items omitted]'
+        return [_sanitize_for_firestore(item, max_depth - 1) for item in data]
+    elif isinstance(data, (str, int, float, bool)) or data is None:
+        return data
+    elif isinstance(data, datetime):
+        return data.isoformat()
+    elif isinstance(data, date):
+        return data.isoformat()
+    else:
+        return str(data)[:500]
 
 
 # ══════════════════════════════════════════════════════
@@ -105,12 +151,12 @@ def _safe_call(fn, *args, default=None):
 @https_fn.on_call(region=REGION, memory=options.MemoryOption.GB_1, timeout_sec=540, secrets=[GARMIN_KEY_SECRET])
 def garmin_login(req: https_fn.CallableRequest) -> dict:
     """Authenticate with Garmin Connect via Garth (same flow as mobile app)."""
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
     email = req.data.get('email', '')
     password = req.data.get('password', '')
@@ -128,7 +174,7 @@ def garmin_login(req: https_fn.CallableRequest) -> dict:
         client.garth = garth.client
         display_name = client.get_full_name()
 
-        # Persist encrypted session (login only — no data sync here)
+        # Persist encrypted session
         db.document(f'users/{uid}').set({
             'garmin': {
                 'connected': True,
@@ -136,9 +182,21 @@ def garmin_login(req: https_fn.CallableRequest) -> dict:
                 'garminEmail': encrypt(email),
                 'connectedAt': firestore.SERVER_TIMESTAMP,
                 'lastSyncAt': None,
-                'backfillStatus': 'pending',
+                'backfillStatus': 'syncing',
                 'backfillProgress': 0,
                 'displayName': display_name,
+            }
+        }, merge=True)
+
+        # Kick off initial sync (first 30 days + today)
+        _do_sync(uid, client, backfill_days=30)
+        _save_session(uid)
+
+        # Mark initial backfill as complete (30 days done)
+        db.document(f'users/{uid}').set({
+            'garmin': {
+                'backfillStatus': 'complete',
+                'backfillProgress': 100,
             }
         }, merge=True)
 
@@ -151,9 +209,10 @@ def garmin_login(req: https_fn.CallableRequest) -> dict:
                 code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
                 message='Garmin MFA required — please disable MFA or provide code',
             )
+        print(f'Garmin login failed for {uid}: {msg}')
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
-            message=f'Garmin login failed: {msg}',
+            message='Garmin login failed. Please check your credentials and try again.',
         )
 
 
@@ -164,21 +223,22 @@ def garmin_login(req: https_fn.CallableRequest) -> dict:
 @https_fn.on_call(region=REGION, secrets=[GARMIN_KEY_SECRET])
 def garmin_disconnect(req: https_fn.CallableRequest) -> dict:
     """Disconnect Garmin — remove tokens but keep historical data."""
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
-    db.document(f'users/{uid}').set({
-        'garmin': {
-            'connected': False,
-            'garthSession': firestore.DELETE_FIELD,
-            'garminEmail': firestore.DELETE_FIELD,
-            'disconnectedAt': firestore.SERVER_TIMESTAMP,
-        }
-    }, merge=True)
+    # Use dot-notation with update() for DELETE_FIELD to work correctly.
+    # set(merge=True) with nested dicts replaces the entire nested object,
+    # which prevents DELETE_FIELD from working as expected.
+    db.document(f'users/{uid}').update({
+        'garmin.connected': False,
+        'garmin.garthSession': firestore.DELETE_FIELD,
+        'garmin.garminEmail': firestore.DELETE_FIELD,
+        'garmin.disconnectedAt': firestore.SERVER_TIMESTAMP,
+    })
 
     return {'status': 'disconnected'}
 
@@ -200,7 +260,7 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
         d = today - timedelta(days=i)
         ds = d.isoformat()
 
-        daily = {
+        daily = _sanitize_for_firestore({
             'date': ds,
             'stats': _safe_call(client.get_stats, ds, default={}),
             'heartRates': _safe_call(client.get_heart_rates, ds, default={}),
@@ -211,9 +271,9 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
             'spo2': _safe_call(client.get_spo2_data, ds, default={}),
             'respiration': _safe_call(client.get_respiration_data, ds, default={}),
             'trainingReadiness': _safe_call(client.get_training_readiness, ds, default={}),
-            'processedAt': firestore.SERVER_TIMESTAMP,
-            'source': 'garmin_pull',
-        }
+        })
+        daily['processedAt'] = firestore.SERVER_TIMESTAMP
+        daily['source'] = 'garmin_pull'
 
         ref = db.document(f'users/{uid}/garminDailies/{ds}')
         batch.set(ref, daily, merge=True)
@@ -231,9 +291,10 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
         act_id = str(act.get('activityId', ''))
         if act_id:
             ref = db.document(f'users/{uid}/activities/{act_id}')
-            act['processedAt'] = firestore.SERVER_TIMESTAMP
-            act['source'] = 'garmin_pull'
-            batch.set(ref, act, merge=True)
+            clean_act = _sanitize_for_firestore(act)
+            clean_act['processedAt'] = firestore.SERVER_TIMESTAMP
+            clean_act['source'] = 'garmin_pull'
+            batch.set(ref, clean_act, merge=True)
             write_count += 1
 
             if write_count >= 450:
@@ -252,12 +313,12 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
 @https_fn.on_call(region=REGION, memory=options.MemoryOption.MB_512, secrets=[GARMIN_KEY_SECRET])
 def garmin_sync_on_demand(req: https_fn.CallableRequest) -> dict:
     """Pull latest Garmin data when user opens the app."""
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
     client = _restore_client(uid)
     _do_sync(uid, client, backfill_days=2)  # Today + yesterday
@@ -310,15 +371,26 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
     Pull extended historical data. Called after initial connection.
     Chunks into manageable pieces to stay within function timeout.
     """
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
-    days_back = req.data.get('daysBack', 365)  # Default 1 year
-    start_offset = req.data.get('startOffset', 0)  # For pagination
+    # Validate and clamp inputs
+    try:
+        days_back = int(req.data.get('daysBack', 365))
+    except (ValueError, TypeError):
+        days_back = 365
+    days_back = max(1, min(days_back, 730))  # Clamp to 2 years max
+
+    try:
+        start_offset = int(req.data.get('startOffset', 0))
+    except (ValueError, TypeError):
+        start_offset = 0
+    start_offset = max(0, start_offset)
+
     chunk_size = 60  # Process 60 days per invocation (within 9-min timeout)
 
     client = _restore_client(uid)
@@ -334,7 +406,7 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
         d = today - timedelta(days=i)
         ds = d.isoformat()
 
-        daily = {
+        daily = _sanitize_for_firestore({
             'date': ds,
             'stats': _safe_call(client.get_stats, ds, default={}),
             'heartRates': _safe_call(client.get_heart_rates, ds, default={}),
@@ -344,9 +416,9 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
             'hrv': _safe_call(client.get_hrv_data, ds, default={}),
             'spo2': _safe_call(client.get_spo2_data, ds, default={}),
             'respiration': _safe_call(client.get_respiration_data, ds, default={}),
-            'processedAt': firestore.SERVER_TIMESTAMP,
-            'source': 'garmin_backfill',
-        }
+        })
+        daily['processedAt'] = firestore.SERVER_TIMESTAMP
+        daily['source'] = 'garmin_backfill'
 
         ref = db.document(f'users/{uid}/garminDailies/{ds}')
         batch.set(ref, daily, merge=True)
@@ -378,9 +450,10 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
         act_id = str(act.get('activityId', ''))
         if act_id:
             ref = db.document(f'users/{uid}/activities/{act_id}')
-            act['processedAt'] = firestore.SERVER_TIMESTAMP
-            act['source'] = 'garmin_backfill'
-            act_batch.set(ref, act, merge=True)
+            clean_act = _sanitize_for_firestore(act)
+            clean_act['processedAt'] = firestore.SERVER_TIMESTAMP
+            clean_act['source'] = 'garmin_backfill'
+            act_batch.set(ref, clean_act, merge=True)
             act_count += 1
             if act_count >= 450:
                 act_batch.commit()
@@ -425,12 +498,12 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
 @https_fn.on_call(region=REGION, timeout_sec=300, secrets=[GARMIN_KEY_SECRET])
 def delete_user_data(req: https_fn.CallableRequest) -> dict:
     """GDPR right to deletion — remove all user data."""
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
     subcollections = [
         'activities', 'healthLog', 'interventions', 'trainingPlans',
@@ -556,7 +629,6 @@ def _get_anthropic_client():
 def _build_daily_context(uid: str) -> dict:
     """Gather comprehensive health context for AI analysis."""
     today_str = date.today().isoformat()
-    week_ago = (date.today() - timedelta(days=7)).isoformat()
 
     # User settings
     user_doc = db.document(f'users/{uid}').get().to_dict() or {}
@@ -584,11 +656,10 @@ def _build_daily_context(uid: str) -> dict:
     # Recent activities
     activities = []
     act_q = db.collection(f'users/{uid}/activities').order_by(
-        'date', direction='DESCENDING'
+        'startTimeLocal', direction='DESCENDING'
     ).limit(10)
     for doc_snap in act_q.stream():
         d = doc_snap.to_dict()
-        # Strip large fields to reduce token count
         for key in ['samples', 'laps', 'splits', 'geoPolylineDTO']:
             d.pop(key, None)
         activities.append(d)
@@ -612,12 +683,24 @@ def _build_daily_context(uid: str) -> dict:
 def _parse_ai_json(text: str) -> dict:
     """Extract JSON from Claude response, handling markdown fences."""
     text = text.strip()
+    # Strip markdown fences (```json ... ``` or ``` ... ```)
     if text.startswith('```'):
-        # Remove markdown code fences
-        lines = text.split('\n')
-        lines = [l for l in lines if not l.strip().startswith('```')]
-        text = '\n'.join(lines)
-    return json.loads(text)
+        # Find opening fence end
+        first_nl = text.index('\n')
+        # Find closing fence
+        last_fence = text.rfind('```', 3)
+        if last_fence > 3:
+            text = text[first_nl + 1:last_fence].strip()
+        else:
+            text = text[first_nl + 1:].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f'Failed to parse AI JSON: {e}\nRaw text: {text[:500]}')
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INTERNAL,
+            message='AI returned an invalid response. Please try again.',
+        )
 
 
 # ══════════════════════════════════════════════════════
@@ -632,12 +715,12 @@ def _parse_ai_json(text: str) -> dict:
 )
 def ai_daily_analysis(req: https_fn.CallableRequest) -> dict:
     """Run AI daily health analysis for a user."""
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
     context = _build_daily_context(uid)
     client = _get_anthropic_client()
@@ -685,12 +768,12 @@ def ai_daily_analysis(req: https_fn.CallableRequest) -> dict:
 )
 def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
     """Generate AI weekly training plan."""
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
     context = _build_daily_context(uid)
     client = _get_anthropic_client()
@@ -704,13 +787,10 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
 
     result = _parse_ai_json(response.content[0].text)
 
-    # Store training plan
+    # Store training plan — plan for the CURRENT week (Monday to Sunday)
     today = date.today()
-    # Find next Monday
-    days_until_monday = (7 - today.weekday()) % 7
-    if days_until_monday == 0:
-        days_until_monday = 7
-    week_start = today + timedelta(days=days_until_monday)
+    days_since_monday = today.weekday()  # 0=Mon, 6=Sun
+    week_start = today - timedelta(days=days_since_monday)
     week_end = week_start + timedelta(days=6)
 
     sessions = result.get('sessions', [])
@@ -750,18 +830,23 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
 )
 def ai_on_demand(req: https_fn.CallableRequest) -> dict:
     """Answer ad-hoc health/fitness questions with user context."""
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
     question = req.data.get('question', '')
     if not question:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
             message='Question is required',
+        )
+    if len(question) > 2000:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='Question must be 2000 characters or fewer',
         )
 
     context = _build_daily_context(uid)
@@ -786,7 +871,7 @@ If asked about concerning symptoms, recommend consulting a doctor.""",
 
 
 # ══════════════════════════════════════════════════════
-# COMPUTE ACTIVITY STATS (Phase 9)
+# COMPUTE ACTIVITY STATS (Nightly)
 # ══════════════════════════════════════════════════════
 
 @scheduler_fn.on_schedule(
@@ -810,18 +895,16 @@ def compute_activity_stats(event: scheduler_fn.ScheduledEvent) -> None:
 def _compute_weekly_stats(uid: str):
     """Compute weekly activity stats for a user."""
     today = date.today()
-    # Current week (Mon-Sun)
     days_since_monday = today.weekday()
     week_start = today - timedelta(days=days_since_monday)
     week_end = week_start + timedelta(days=6)
     period_key = f'week_{week_start.isoformat()}'
 
-    # Fetch activities for this week
     activities = []
-    act_q = db.collection(f'users/{uid}/activities').order_by('date', direction='DESCENDING').limit(50)
+    act_q = db.collection(f'users/{uid}/activities').order_by('startTimeLocal', direction='DESCENDING').limit(100)
     for doc_snap in act_q.stream():
         act = doc_snap.to_dict()
-        act_date_str = (act.get('startTimeLocal') or act.get('date', ''))[:10]
+        act_date_str = (act.get('startTimeLocal') or '')[:10]
         if act_date_str and week_start.isoformat() <= act_date_str <= week_end.isoformat():
             activities.append(act)
 
@@ -829,7 +912,6 @@ def _compute_weekly_stats(uid: str):
     total_distance = sum(a.get('distance', 0) or 0 for a in activities)
     total_calories = sum(a.get('calories', a.get('activeKilocalories', 0)) or 0 for a in activities)
 
-    # By sport type
     by_type = {}
     for act in activities:
         t = act.get('activityType', {}).get('typeKey', 'other') if isinstance(act.get('activityType'), dict) else 'other'
@@ -853,18 +935,18 @@ def _compute_weekly_stats(uid: str):
 
 
 # ══════════════════════════════════════════════════════
-# DATA EXPORT (Phase 10)
+# DATA EXPORT (GDPR)
 # ══════════════════════════════════════════════════════
 
 @https_fn.on_call(region=REGION, timeout_sec=300)
 def data_export(req: https_fn.CallableRequest) -> dict:
     """Export all user data as JSON (GDPR right to access)."""
-    uid = req.auth.uid
-    if not uid:
+    if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
+    uid = req.auth.uid
 
     export = {'exportedAt': datetime.utcnow().isoformat(), 'userId': uid}
 
@@ -872,7 +954,6 @@ def data_export(req: https_fn.CallableRequest) -> dict:
     user_doc = db.document(f'users/{uid}').get()
     if user_doc.exists:
         settings = user_doc.to_dict()
-        # Remove encrypted credentials
         garmin = settings.get('garmin', {})
         garmin.pop('garthSession', None)
         garmin.pop('garminEmail', None)
@@ -890,7 +971,6 @@ def data_export(req: https_fn.CallableRequest) -> dict:
         for doc_snap in db.collection(f'users/{uid}/{sub}').stream():
             d = doc_snap.to_dict()
             d['_id'] = doc_snap.id
-            # Convert timestamps to strings for JSON serialization
             for k, v in d.items():
                 if hasattr(v, 'isoformat'):
                     d[k] = v.isoformat()

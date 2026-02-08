@@ -1,14 +1,6 @@
 {
   "indexes": [
     {
-      "collectionGroup": "activities",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "activityType", "order": "ASCENDING" },
-        { "fieldPath": "date", "order": "DESCENDING" }
-      ]
-    },
-    {
       "collectionGroup": "healthLog",
       "queryScope": "COLLECTION",
       "fields": [

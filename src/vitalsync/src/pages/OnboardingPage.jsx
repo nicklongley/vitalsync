@@ -125,6 +125,10 @@ export default function OnboardingPage() {
         totalHoursPerWeek: totalHours,
         schedule,
       },
+      preferences: {
+        units: 'metric',
+        aiPersonality: 'coach',
+      },
       onboardingComplete: true,
     };
 

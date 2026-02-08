@@ -6,7 +6,7 @@
 import { useState, useEffect } from 'react';
 import {
   doc, collection, query, orderBy, limit, onSnapshot,
-  where, getDoc, addDoc, deleteDoc, updateDoc, serverTimestamp,
+  where,
 } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '@/lib/firebase';
@@ -27,6 +27,9 @@ export function useGarminToday() {
     const unsubscribe = onSnapshot(ref, (snap) => {
       setData(snap.exists() ? snap.data() : null);
       setLoading(false);
+    }, (err) => {
+      console.error('Error listening to garminDailies:', err);
+      setLoading(false);
     });
 
     return () => unsubscribe();
@@ -44,25 +47,30 @@ export function useGarminWeek() {
   useEffect(() => {
     if (!user) return;
 
-    async function fetchWeek() {
-      const days = [];
-      for (let i = 6; i >= 0; i--) {
-        days.push(format(subDays(new Date(), i), 'yyyy-MM-dd'));
-      }
-
-      const weekData = await Promise.all(
-        days.map(async (dateStr) => {
-          const ref = doc(db, 'users', user.uid, 'garminDailies', dateStr);
-          const snap = await getDoc(ref);
-          return snap.exists() ? { date: dateStr, ...snap.data() } : { date: dateStr };
-        })
-      );
-
-      setData(weekData);
-      setLoading(false);
+    const days = [];
+    for (let i = 6; i >= 0; i--) {
+      days.push(format(subDays(new Date(), i), 'yyyy-MM-dd'));
     }
 
-    fetchWeek();
+    // Set up real-time listeners for each day
+    const unsubs = days.map((dateStr, idx) => {
+      const ref = doc(db, 'users', user.uid, 'garminDailies', dateStr);
+      return onSnapshot(ref, (snap) => {
+        setData((prev) => {
+          const next = [...prev];
+          next[idx] = snap.exists() ? { date: dateStr, ...snap.data() } : { date: dateStr };
+          return next;
+        });
+        setLoading(false);
+      }, (err) => {
+        console.error(`Error listening to garminDailies/${dateStr}:`, err);
+      });
+    });
+
+    // Initialize with empty entries
+    setData(days.map((dateStr) => ({ date: dateStr })));
+
+    return () => unsubs.forEach((unsub) => unsub());
   }, [user]);
 
   return { data, loading };
@@ -85,6 +93,9 @@ export function useRecentActivities(count = 10) {
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
       setActivities(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
+      setLoading(false);
+    }, (err) => {
+      console.error('Error listening to activities:', err);
       setLoading(false);
     });
 
@@ -123,23 +134,18 @@ export function useGarminSync() {
   async function connectGarmin(email, password) {
     if (!user) throw new Error('Must be signed in');
     const garminLoginFn = httpsCallable(functions, 'garmin_login');
-    const result = await garminLoginFn({ email, password });
-    return result.data; // { status, displayName }
+    return garminLoginFn({ email, password });
   }
 
   // Disconnect Garmin
   async function disconnectGarmin() {
     if (!user) throw new Error('Must be signed in');
     const garminDisconnectFn = httpsCallable(functions, 'garmin_disconnect');
-    const result = await garminDisconnectFn();
-    return result.data;
+    return garminDisconnectFn();
   }
-
-  const displayName = garmin.displayName || null;
 
   return {
     connected,
-    displayName,
     backfillStatus,
     backfillProgress,
     lastSyncAt,
@@ -178,6 +184,9 @@ export function useHealthLog(type = null, count = 20) {
     const unsubscribe = onSnapshot(q, (snapshot) => {
       setEntries(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
       setLoading(false);
+    }, (err) => {
+      console.error('Error listening to healthLog:', err);
+      setLoading(false);
     });
 
     return () => unsubscribe();
@@ -186,36 +195,8 @@ export function useHealthLog(type = null, count = 20) {
   return { entries, loading };
 }
 
-// ── Health log mutations ──
-export function useHealthLogMutations() {
-  const { user } = useAuth();
-
-  async function createEntry(type, date, data) {
-    if (!user) throw new Error('Must be signed in');
-    const ref = collection(db, 'users', user.uid, 'healthLog');
-    return addDoc(ref, {
-      type,
-      date,
-      data,
-      enteredAt: serverTimestamp(),
-    });
-  }
-
-  async function deleteEntry(entryId) {
-    if (!user) throw new Error('Must be signed in');
-    return deleteDoc(doc(db, 'users', user.uid, 'healthLog', entryId));
-  }
-
-  async function updateEntry(entryId, updates) {
-    if (!user) throw new Error('Must be signed in');
-    return updateDoc(doc(db, 'users', user.uid, 'healthLog', entryId), updates);
-  }
-
-  return { createEntry, deleteEntry, updateEntry };
-}
-
 // ── Activity stats (aggregated periods) ──
-export function useActivityStats(periodType = 'week', count = 12) {
+export function useActivityStats(periodType = 'week', sport = 'all', count = 12) {
   const { user } = useAuth();
   const [stats, setStats] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -223,20 +204,31 @@ export function useActivityStats(periodType = 'week', count = 12) {
   useEffect(() => {
     if (!user) return;
 
-    const q = query(
-      collection(db, 'users', user.uid, 'activityStats'),
+    const constraints = [
       where('periodType', '==', periodType),
       orderBy('periodStart', 'desc'),
-      limit(count)
+      limit(count),
+    ];
+
+    if (sport && sport !== 'all') {
+      constraints.splice(1, 0, where('sport', '==', sport));
+    }
+
+    const q = query(
+      collection(db, 'users', user.uid, 'activityStats'),
+      ...constraints
     );
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
       setStats(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
       setLoading(false);
+    }, (err) => {
+      console.error('Error listening to activityStats:', err);
+      setLoading(false);
     });
 
     return () => unsubscribe();
-  }, [user, periodType, count]);
+  }, [user, periodType, sport, count]);
 
   return { stats, loading };
 }

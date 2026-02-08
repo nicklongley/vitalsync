@@ -11,6 +11,11 @@
     -moz-osx-font-smoothing: grayscale;
   }
 
+  /* Focus-visible for keyboard navigation (WCAG 2.4.7) */
+  *:focus-visible {
+    @apply outline-2 outline-offset-2 outline-emerald-400;
+  }
+
   /* Monospace numbers for all metric displays */
   .font-metric {
     @apply font-mono tabular-nums;
@@ -83,6 +88,15 @@
   /* ── Action prompt card ── */
   .prompt-card {
     @apply glass-card p-4 flex items-center gap-3 animate-fade-in;
+  }
+
+  /* ── Safe area padding for iOS home indicator ── */
+  .safe-area-pb {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .safe-area-pt {
+    padding-top: env(safe-area-inset-top, 0px);
   }
 }
 
