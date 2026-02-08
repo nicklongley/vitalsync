@@ -13,6 +13,8 @@ import { DateEntryPicker } from '@/components/shared';
 const ENTRY_TYPES = [
   { id: 'weight', label: 'Weight', icon: '\u2696\uFE0F' },
   { id: 'blood_pressure', label: 'BP', icon: '\uD83E\uDE78' },
+  { id: 'glucose', label: 'Glucose', icon: '\uD83E\uDE78' },
+  { id: 'cholesterol', label: 'Chol.', icon: '\uD83E\uDDEA' },
   { id: 'mood', label: 'Mood', icon: '\uD83D\uDE0A' },
   { id: 'notes', label: 'Notes', icon: '\uD83D\uDCDD' },
 ];
@@ -42,6 +44,12 @@ export default function HealthLogTab() {
   const [mood, setMood] = useState(0);
   const [energy, setEnergy] = useState(3);
   const [noteText, setNoteText] = useState('');
+  const [glucose, setGlucose] = useState('');
+  const [glucoseTiming, setGlucoseTiming] = useState('fasting');
+  const [totalChol, setTotalChol] = useState('');
+  const [hdl, setHdl] = useState('');
+  const [ldl, setLdl] = useState('');
+  const [triglycerides, setTriglycerides] = useState('');
 
   async function handleSave() {
     if (!user) return;
@@ -66,6 +74,20 @@ export default function HealthLogTab() {
         entry.systolic = s;
         entry.diastolic = d;
         if (heartRate) entry.heartRate = parseInt(heartRate);
+      } else if (activeType === 'glucose') {
+        const g = parseFloat(glucose);
+        if (!g || g < 1 || g > 40) { setSaving(false); return; }
+        entry.value = g;
+        entry.unit = 'mmol/L';
+        entry.timing = glucoseTiming;
+      } else if (activeType === 'cholesterol') {
+        const tc = parseFloat(totalChol);
+        if (!tc || tc < 1 || tc > 20) { setSaving(false); return; }
+        entry.totalCholesterol = tc;
+        if (hdl) entry.hdl = parseFloat(hdl);
+        if (ldl) entry.ldl = parseFloat(ldl);
+        if (triglycerides) entry.triglycerides = parseFloat(triglycerides);
+        entry.unit = 'mmol/L';
       } else if (activeType === 'mood') {
         if (!mood) { setSaving(false); return; }
         entry.mood = mood;
@@ -80,6 +102,7 @@ export default function HealthLogTab() {
       setSuccess(true);
       // Reset form
       setWeight(''); setWaist(''); setSystolic(''); setDiastolic(''); setHeartRate('');
+      setGlucose(''); setGlucoseTiming('fasting'); setTotalChol(''); setHdl(''); setLdl(''); setTriglycerides('');
       setMood(0); setEnergy(3); setNoteText('');
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
@@ -183,6 +206,93 @@ export default function HealthLogTab() {
           </div>
         )}
 
+        {activeType === 'glucose' && (
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-slate-400 block mb-1">Blood Glucose (mmol/L)</label>
+              <input
+                type="number"
+                step="0.1"
+                value={glucose}
+                onChange={e => setGlucose(e.target.value)}
+                placeholder="e.g. 5.5"
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white text-lg font-mono
+                           placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-slate-400 block mb-2">Timing</label>
+              <div className="grid grid-cols-2 gap-2">
+                {['fasting', 'before meal', 'after meal', 'random'].map(t => (
+                  <button key={t} onClick={() => setGlucoseTiming(t)}
+                    className={`py-2 rounded-xl text-xs font-medium transition-colors ${
+                      glucoseTiming === t
+                        ? 'bg-emerald-600/20 border border-emerald-700/50 text-emerald-400'
+                        : 'bg-slate-800 border border-slate-700 text-slate-400'
+                    }`}>
+                    {t.charAt(0).toUpperCase() + t.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeType === 'cholesterol' && (
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-slate-400 block mb-1">Total Cholesterol (mmol/L)</label>
+              <input
+                type="number"
+                step="0.1"
+                value={totalChol}
+                onChange={e => setTotalChol(e.target.value)}
+                placeholder="e.g. 5.2"
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white text-lg font-mono
+                           placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors"
+              />
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="text-xs text-slate-400 block mb-1">HDL</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={hdl}
+                  onChange={e => setHdl(e.target.value)}
+                  placeholder="1.5"
+                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white font-mono
+                             placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-slate-400 block mb-1">LDL</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={ldl}
+                  onChange={e => setLdl(e.target.value)}
+                  placeholder="3.0"
+                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white font-mono
+                             placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-slate-400 block mb-1">Trig.</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={triglycerides}
+                  onChange={e => setTriglycerides(e.target.value)}
+                  placeholder="1.7"
+                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white font-mono
+                             placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors"
+                />
+              </div>
+            </div>
+          </div>
+        )}
+
         {activeType === 'mood' && (
           <div className="space-y-4">
             <div>
@@ -280,7 +390,7 @@ export default function HealthLogTab() {
 }
 
 function getEntryIcon(type) {
-  const icons = { weight: '\u2696\uFE0F', blood_pressure: '\uD83E\uDE78', mood: '\uD83D\uDE0A', notes: '\uD83D\uDCDD' };
+  const icons = { weight: '\u2696\uFE0F', blood_pressure: '\uD83E\uDE78', glucose: '\uD83E\uDE78', cholesterol: '\uD83E\uDDEA', mood: '\uD83D\uDE0A', notes: '\uD83D\uDCDD' };
   return icons[type] || '\uD83D\uDCCB';
 }
 
@@ -291,6 +401,13 @@ function formatEntry(entry) {
     case 'mood': {
       const emoji = MOOD_OPTIONS.find(m => m.value === entry.mood)?.emoji || '';
       return `${emoji} ${MOOD_OPTIONS.find(m => m.value === entry.mood)?.label || ''} \u00B7 Energy: ${entry.energy}/5`;
+    }
+    case 'glucose': return `${entry.value} mmol/L \u00B7 ${entry.timing || 'random'}`;
+    case 'cholesterol': {
+      let s = `Total: ${entry.totalCholesterol} mmol/L`;
+      if (entry.hdl) s += ` \u00B7 HDL: ${entry.hdl}`;
+      if (entry.ldl) s += ` \u00B7 LDL: ${entry.ldl}`;
+      return s;
     }
     case 'notes': return entry.text?.slice(0, 60) + (entry.text?.length > 60 ? '...' : '');
     default: return entry.type;

@@ -86,7 +86,36 @@ def _restore_client(uid: str) -> Garmin:
 
     # display_name is required for Garmin API URL construction.
     # Without it, API paths contain '/None/' and return 403.
-    client.display_name = garmin_cfg.get('displayName') or client.get_full_name()
+    display_name = garmin_cfg.get('displayName')
+    if not display_name:
+        try:
+            display_name = client.get_full_name()
+        except Exception:
+            pass
+    if not display_name:
+        # Fallback: try garth profile fields
+        try:
+            profile = garth.client.profile
+            display_name = profile.get('displayName') or profile.get('userName') or profile.get('fullName')
+        except Exception:
+            pass
+    if not display_name:
+        # Last resort: fetch social profile which reliably returns displayName
+        try:
+            social = client.get_social_profile()
+            display_name = social.get('displayName') or social.get('userName')
+        except Exception:
+            pass
+    if not display_name:
+        print(f'WARNING: Could not determine display_name for {uid}, API calls may fail')
+    client.display_name = display_name
+    print(f'Restored client for {uid}, display_name={display_name}')
+
+    # Persist display_name if we found it and it wasn't stored
+    if display_name and not garmin_cfg.get('displayName'):
+        db.document(f'users/{uid}').set({
+            'garmin': {'displayName': display_name}
+        }, merge=True)
 
     return client
 
@@ -116,9 +145,16 @@ def _sanitize_for_firestore(data, max_depth=10):
     Firestore has a 20-level nesting limit and 1MB doc limit.
     Also removes large arrays (e.g. per-minute stress values)
     and converts unsupported types (datetime, etc.) to strings.
+    Handles NaN, Inf, bytes, and other non-Firestore types.
     """
+    import math
+
     if max_depth <= 0:
-        if isinstance(data, (str, int, float, bool)) or data is None:
+        if isinstance(data, (str, int, bool)) or data is None:
+            return data
+        if isinstance(data, float):
+            if math.isnan(data) or math.isinf(data):
+                return None
             return data
         return str(data)[:200]
 
@@ -134,8 +170,18 @@ def _sanitize_for_firestore(data, max_depth=10):
         if len(data) > 100:
             return f'[{len(data)} items omitted]'
         return [_sanitize_for_firestore(item, max_depth - 1) for item in data]
-    elif isinstance(data, (str, int, float, bool)) or data is None:
+    elif isinstance(data, bool):
         return data
+    elif isinstance(data, int):
+        return data
+    elif isinstance(data, float):
+        if math.isnan(data) or math.isinf(data):
+            return None
+        return data
+    elif isinstance(data, str) or data is None:
+        return data
+    elif isinstance(data, bytes):
+        return data.decode('utf-8', errors='replace')[:500]
     elif isinstance(data, datetime):
         return data.isoformat()
     elif isinstance(data, date):
@@ -173,6 +219,20 @@ def garmin_login(req: https_fn.CallableRequest) -> dict:
         client = Garmin()
         client.garth = garth.client
         display_name = client.get_full_name()
+        if not display_name:
+            # Fallback: try garth profile or social profile
+            try:
+                profile = garth.client.profile
+                display_name = profile.get('displayName') or profile.get('userName') or profile.get('fullName')
+            except Exception:
+                pass
+        if not display_name:
+            try:
+                social = client.get_social_profile()
+                display_name = social.get('displayName') or social.get('userName')
+            except Exception:
+                pass
+        client.display_name = display_name
 
         # Persist encrypted session
         db.document(f'users/{uid}').set({
@@ -251,17 +311,17 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
     """
     Pull Garmin data for the last N days and write to Firestore.
     backfill_days=1 for daily sync, 30 for initial, 730 for full backfill.
+    Each daily document is written individually so one bad field
+    doesn't block the rest.
     """
     today = date.today()
-    batch = db.batch()
-    write_count = 0
 
     for i in range(backfill_days):
         d = today - timedelta(days=i)
         ds = d.isoformat()
 
-        daily = _sanitize_for_firestore({
-            'date': ds,
+        # Fetch each data source individually
+        data_sources = {
             'stats': _safe_call(client.get_stats, ds, default={}),
             'heartRates': _safe_call(client.get_heart_rates, ds, default={}),
             'sleep': _safe_call(client.get_sleep_data, ds, default={}),
@@ -271,36 +331,55 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
             'spo2': _safe_call(client.get_spo2_data, ds, default={}),
             'respiration': _safe_call(client.get_respiration_data, ds, default={}),
             'trainingReadiness': _safe_call(client.get_training_readiness, ds, default={}),
-        })
-        daily['processedAt'] = firestore.SERVER_TIMESTAMP
-        daily['source'] = 'garmin_pull'
+        }
 
         ref = db.document(f'users/{uid}/garminDailies/{ds}')
-        batch.set(ref, daily, merge=True)
-        write_count += 1
 
-        # Firestore batch limit = 500
-        if write_count >= 450:
-            batch.commit()
-            batch = db.batch()
-            write_count = 0
+        # Debug: log what we fetched
+        for fn, fd in data_sources.items():
+            keys = list(fd.keys())[:5] if isinstance(fd, dict) else 'N/A'
+            size = len(fd) if hasattr(fd, '__len__') else 0
+            print(f'  {ds}/{fn}: {size} keys, sample={keys}')
+
+        # Write each field individually so one bad field doesn't block others
+        base = {'date': ds, 'processedAt': firestore.SERVER_TIMESTAMP, 'source': 'garmin_pull'}
+        for field_name, field_data in data_sources.items():
+            try:
+                sanitized = _sanitize_for_firestore(field_data)
+                ref.set({**base, field_name: sanitized}, merge=True)
+            except Exception as e:
+                # If sanitization wasn't enough, force JSON round-trip to strip
+                # all non-serializable types, then retry
+                try:
+                    import json
+                    json_safe = json.loads(json.dumps(field_data, default=str))
+                    sanitized = _sanitize_for_firestore(json_safe)
+                    ref.set({**base, field_name: sanitized}, merge=True)
+                except Exception as e2:
+                    print(f'Failed to write {field_name} for {ds} (even after JSON round-trip): {e2}')
+                    # Last resort: skip this field entirely
 
     # Sync recent activities (last 20)
     activities = _safe_call(client.get_activities, 0, 20, default=[])
+    batch = db.batch()
+    write_count = 0
     for act in (activities or []):
         act_id = str(act.get('activityId', ''))
         if act_id:
-            ref = db.document(f'users/{uid}/activities/{act_id}')
-            clean_act = _sanitize_for_firestore(act)
-            clean_act['processedAt'] = firestore.SERVER_TIMESTAMP
-            clean_act['source'] = 'garmin_pull'
-            batch.set(ref, clean_act, merge=True)
-            write_count += 1
+            try:
+                ref = db.document(f'users/{uid}/activities/{act_id}')
+                clean_act = _sanitize_for_firestore(act)
+                clean_act['processedAt'] = firestore.SERVER_TIMESTAMP
+                clean_act['source'] = 'garmin_pull'
+                batch.set(ref, clean_act, merge=True)
+                write_count += 1
 
-            if write_count >= 450:
-                batch.commit()
-                batch = db.batch()
-                write_count = 0
+                if write_count >= 450:
+                    batch.commit()
+                    batch = db.batch()
+                    write_count = 0
+            except Exception as e:
+                print(f'Failed to write activity {act_id}: {e}')
 
     if write_count > 0:
         batch.commit()
@@ -368,8 +447,10 @@ def garmin_scheduled_sync(event: scheduler_fn.ScheduledEvent) -> None:
 )
 def garmin_backfill(req: https_fn.CallableRequest) -> dict:
     """
-    Pull extended historical data. Called after initial connection.
-    Chunks into manageable pieces to stay within function timeout.
+    Pull full activity history from Garmin.
+    Paginates through all activities (up to 10,000) and writes to Firestore.
+    After activities are saved, computes weekly stats.
+    Supports chunked pagination via startPage parameter.
     """
     if not req.auth:
         raise https_fn.HttpsError(
@@ -378,102 +459,81 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
         )
     uid = req.auth.uid
 
-    # Validate and clamp inputs
     try:
-        days_back = int(req.data.get('daysBack', 365))
+        start_page = int(req.data.get('startPage', 0))
     except (ValueError, TypeError):
-        days_back = 365
-    days_back = max(1, min(days_back, 730))  # Clamp to 2 years max
+        start_page = 0
 
-    try:
-        start_offset = int(req.data.get('startOffset', 0))
-    except (ValueError, TypeError):
-        start_offset = 0
-    start_offset = max(0, start_offset)
-
-    chunk_size = 60  # Process 60 days per invocation (within 9-min timeout)
+    PAGE_SIZE = 100
+    MAX_PAGES_PER_CALL = 50  # 5000 activities per invocation (within 9-min timeout)
 
     client = _restore_client(uid)
+    print(f'Backfill started for {uid}, display_name={client.display_name}, startPage={start_page}')
 
-    actual_start = start_offset
-    actual_end = min(start_offset + chunk_size, days_back)
+    db.document(f'users/{uid}').set({
+        'garmin': {'backfillStatus': 'syncing'}
+    }, merge=True)
 
-    today = date.today()
-    batch = db.batch()
-    write_count = 0
+    total_saved = 0
+    page = start_page
+    found_activities = True
 
-    for i in range(actual_start, actual_end):
-        d = today - timedelta(days=i)
-        ds = d.isoformat()
-
-        daily = _sanitize_for_firestore({
-            'date': ds,
-            'stats': _safe_call(client.get_stats, ds, default={}),
-            'heartRates': _safe_call(client.get_heart_rates, ds, default={}),
-            'sleep': _safe_call(client.get_sleep_data, ds, default={}),
-            'stress': _safe_call(client.get_stress_data, ds, default={}),
-            'bodyComp': _safe_call(client.get_body_composition, ds, default={}),
-            'hrv': _safe_call(client.get_hrv_data, ds, default={}),
-            'spo2': _safe_call(client.get_spo2_data, ds, default={}),
-            'respiration': _safe_call(client.get_respiration_data, ds, default={}),
-        })
-        daily['processedAt'] = firestore.SERVER_TIMESTAMP
-        daily['source'] = 'garmin_backfill'
-
-        ref = db.document(f'users/{uid}/garminDailies/{ds}')
-        batch.set(ref, daily, merge=True)
-        write_count += 1
-
-        if write_count >= 450:
-            batch.commit()
-            batch = db.batch()
-            write_count = 0
-
-    if write_count > 0:
-        batch.commit()
-
-    # Backfill activities for this period too
-    all_activities = []
-    page = 0
-    while True:
-        acts = _safe_call(client.get_activities, page * 50, 50, default=[])
+    while found_activities and page < start_page + MAX_PAGES_PER_CALL:
+        print(f'Fetching activities page {page} (offset={page * PAGE_SIZE}, limit={PAGE_SIZE})')
+        acts = _safe_call(client.get_activities, page * PAGE_SIZE, PAGE_SIZE, default=[])
+        print(f'Got {len(acts) if acts else 0} activities from page {page}')
         if not acts:
+            found_activities = False
             break
-        all_activities.extend(acts)
+
+        batch = db.batch()
+        batch_count = 0
+        for act in acts:
+            act_id = str(act.get('activityId', ''))
+            if act_id:
+                try:
+                    ref = db.document(f'users/{uid}/activities/{act_id}')
+                    clean_act = _sanitize_for_firestore(act)
+                    clean_act['processedAt'] = firestore.SERVER_TIMESTAMP
+                    clean_act['source'] = 'garmin_backfill'
+                    batch.set(ref, clean_act, merge=True)
+                    batch_count += 1
+                    if batch_count >= 450:
+                        batch.commit()
+                        batch = db.batch()
+                        batch_count = 0
+                except Exception as e:
+                    print(f'Failed to write activity {act_id}: {e}')
+
+        if batch_count > 0:
+            batch.commit()
+
+        total_saved += len(acts)
         page += 1
-        if page > 40:  # Safety: max 2000 activities
-            break
 
-    act_batch = db.batch()
-    act_count = 0
-    for act in all_activities:
-        act_id = str(act.get('activityId', ''))
-        if act_id:
-            ref = db.document(f'users/{uid}/activities/{act_id}')
-            clean_act = _sanitize_for_firestore(act)
-            clean_act['processedAt'] = firestore.SERVER_TIMESTAMP
-            clean_act['source'] = 'garmin_backfill'
-            act_batch.set(ref, clean_act, merge=True)
-            act_count += 1
-            if act_count >= 450:
-                act_batch.commit()
-                act_batch = db.batch()
-                act_count = 0
+        # Update progress
+        db.document(f'users/{uid}').set({
+            'garmin': {
+                'backfillProgress': total_saved,
+                'backfillStatus': 'syncing',
+            }
+        }, merge=True)
 
-    if act_count > 0:
-        act_batch.commit()
+        # If we got fewer than PAGE_SIZE, we've reached the end
+        if len(acts) < PAGE_SIZE:
+            found_activities = False
 
     _save_session(uid)
 
-    # Update backfill progress
-    progress = min(95, round((actual_end / max(1, days_back)) * 100))
-    db.document(f'users/{uid}').set({
-        'garmin': {'backfillProgress': progress}
-    }, merge=True)
-
-    has_more = actual_end < days_back
+    has_more = found_activities  # True if we hit the per-call page limit
 
     if not has_more:
+        # All activities loaded — compute weekly stats and mark complete
+        try:
+            _compute_all_stats(uid)
+        except Exception as e:
+            print(f'Stats computation failed after backfill for {uid}: {e}')
+
         db.document(f'users/{uid}').set({
             'garmin': {
                 'backfillStatus': 'complete',
@@ -483,11 +543,9 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
 
     return {
         'status': 'ok',
-        'daysProcessed': actual_end - actual_start,
-        'totalActivities': len(all_activities),
-        'progress': progress,
+        'totalActivities': total_saved,
         'hasMore': has_more,
-        'nextOffset': actual_end if has_more else None,
+        'nextPage': page if has_more else None,
     }
 
 
@@ -726,10 +784,10 @@ def ai_daily_analysis(req: https_fn.CallableRequest) -> dict:
     client = _get_anthropic_client()
 
     response = client.messages.create(
-        model='claude-sonnet-4-20250514',
+        model='claude-sonnet-4-5-20250929',
         max_tokens=2000,
         system=DAILY_ANALYSIS_PROMPT,
-        messages=[{'role': 'user', 'content': json.dumps(context)}],
+        messages=[{'role': 'user', 'content': json.dumps(context, default=str)}],
     )
 
     result = _parse_ai_json(response.content[0].text)
@@ -745,7 +803,7 @@ def ai_daily_analysis(req: https_fn.CallableRequest) -> dict:
             'status': 'active',
             'period': 'daily',
             'createdAt': firestore.SERVER_TIMESTAMP,
-            'generatedBy': 'claude-sonnet-4-20250514',
+            'generatedBy': 'claude-sonnet-4-5-20250929',
         })
     batch.commit()
 
@@ -779,10 +837,10 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
     client = _get_anthropic_client()
 
     response = client.messages.create(
-        model='claude-sonnet-4-20250514',
+        model='claude-sonnet-4-5-20250929',
         max_tokens=3000,
         system=WEEKLY_PLAN_PROMPT,
-        messages=[{'role': 'user', 'content': json.dumps(context)}],
+        messages=[{'role': 'user', 'content': json.dumps(context, default=str)}],
     )
 
     result = _parse_ai_json(response.content[0].text)
@@ -807,7 +865,7 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
         'totalPlannedMinutes': result.get('totalPlannedMinutes', 0),
         'sessions': sessions,
         'createdAt': firestore.SERVER_TIMESTAMP,
-        'generatedBy': 'claude-sonnet-4-20250514',
+        'generatedBy': 'claude-sonnet-4-5-20250929',
     })
 
     return {
@@ -853,14 +911,14 @@ def ai_on_demand(req: https_fn.CallableRequest) -> dict:
     client = _get_anthropic_client()
 
     response = client.messages.create(
-        model='claude-sonnet-4-20250514',
+        model='claude-sonnet-4-5-20250929',
         max_tokens=1500,
         system="""You are a personal health and fitness assistant. You have access to the user's
 Garmin wearable data and health logs. Answer their question using this data.
 Be concise, specific, and actionable. Never diagnose medical conditions.
 If asked about concerning symptoms, recommend consulting a doctor.""",
         messages=[
-            {'role': 'user', 'content': f'My health data:\n{json.dumps(context)}\n\nQuestion: {question}'},
+            {'role': 'user', 'content': f'My health data:\n{json.dumps(context, default=str)}\n\nQuestion: {question}'},
         ],
     )
 
@@ -887,51 +945,135 @@ def compute_activity_stats(event: scheduler_fn.ScheduledEvent) -> None:
     for user_doc in users_ref.stream():
         uid = user_doc.id
         try:
-            _compute_weekly_stats(uid)
+            _compute_all_stats(uid)
         except Exception as e:
             print(f'Stats computation failed for {uid}: {e}')
 
 
-def _compute_weekly_stats(uid: str):
-    """Compute weekly activity stats for a user."""
+@https_fn.on_call(region=REGION, timeout_sec=120)
+def compute_stats_on_demand(req: https_fn.CallableRequest) -> dict:
+    """Trigger activity stats computation for the calling user."""
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+    _compute_all_stats(uid)
+    return {'status': 'ok'}
+
+
+def _compute_all_stats(uid: str):
+    """Compute weekly (52 wks), monthly (24 mo), and yearly activity stats."""
     today = date.today()
+
+    # Load ALL activities with pagination
+    all_activities = []
+    last_doc = None
+    while True:
+        q = db.collection(f'users/{uid}/activities').order_by(
+            'startTimeLocal', direction='DESCENDING'
+        ).limit(1000)
+        if last_doc:
+            q = q.start_after(last_doc)
+        docs = list(q.stream())
+        if not docs:
+            break
+        for doc_snap in docs:
+            all_activities.append(doc_snap.to_dict())
+        last_doc = docs[-1]
+        if len(docs) < 1000:
+            break
+
+    print(f'Computing all stats for {uid}: {len(all_activities)} activities loaded')
+
+    def _aggregate(activities):
+        total_duration = sum(a.get('duration', a.get('movingDuration', 0)) or 0 for a in activities)
+        total_distance = sum(a.get('distance', 0) or 0 for a in activities)
+        total_calories = sum(a.get('calories', a.get('activeKilocalories', 0)) or 0 for a in activities)
+        by_type = {}
+        for act in activities:
+            t = act.get('activityType', {}).get('typeKey', 'other') if isinstance(act.get('activityType'), dict) else 'other'
+            if t not in by_type:
+                by_type[t] = {'count': 0, 'duration': 0, 'distance': 0, 'calories': 0}
+            by_type[t]['count'] += 1
+            by_type[t]['duration'] += (act.get('duration', act.get('movingDuration', 0)) or 0)
+            by_type[t]['distance'] += (act.get('distance', 0) or 0)
+            by_type[t]['calories'] += (act.get('calories', act.get('activeKilocalories', 0)) or 0)
+        return {
+            'activityCount': len(activities),
+            'totalDurationSeconds': total_duration,
+            'totalDistanceMeters': total_distance,
+            'totalCalories': total_calories,
+            'byType': by_type,
+        }
+
+    def _filter(start_date, end_date):
+        s, e = start_date.isoformat(), end_date.isoformat()
+        return [a for a in all_activities if s <= (a.get('startTimeLocal') or '')[:10] <= e]
+
+    batch = db.batch()
+    batch_count = 0
+
+    def _flush():
+        nonlocal batch, batch_count
+        if batch_count > 0:
+            batch.commit()
+            batch = db.batch()
+            batch_count = 0
+
+    def _write_stat(doc_id, data):
+        nonlocal batch, batch_count
+        ref = db.document(f'users/{uid}/activityStats/{doc_id}')
+        batch.set(ref, {**data, 'computedAt': firestore.SERVER_TIMESTAMP}, merge=True)
+        batch_count += 1
+        if batch_count >= 450:
+            _flush()
+
+    # ── Weekly: last 52 weeks ──
     days_since_monday = today.weekday()
-    week_start = today - timedelta(days=days_since_monday)
-    week_end = week_start + timedelta(days=6)
-    period_key = f'week_{week_start.isoformat()}'
+    current_week_start = today - timedelta(days=days_since_monday)
+    for w in range(52):
+        ws = current_week_start - timedelta(weeks=w)
+        we = ws + timedelta(days=6)
+        acts = _filter(ws, we)
+        _write_stat(f'week_{ws.isoformat()}', {
+            'periodType': 'week', 'periodStart': ws.isoformat(), 'periodEnd': we.isoformat(),
+            **_aggregate(acts),
+        })
 
-    activities = []
-    act_q = db.collection(f'users/{uid}/activities').order_by('startTimeLocal', direction='DESCENDING').limit(100)
-    for doc_snap in act_q.stream():
-        act = doc_snap.to_dict()
-        act_date_str = (act.get('startTimeLocal') or '')[:10]
-        if act_date_str and week_start.isoformat() <= act_date_str <= week_end.isoformat():
-            activities.append(act)
+    # ── Monthly: last 24 months ──
+    for m in range(24):
+        mo = today.month - m
+        yr = today.year
+        while mo <= 0:
+            mo += 12
+            yr -= 1
+        ms = date(yr, mo, 1)
+        me = date(yr + 1, 1, 1) - timedelta(days=1) if mo == 12 else date(yr, mo + 1, 1) - timedelta(days=1)
+        acts = _filter(ms, me)
+        _write_stat(f'month_{ms.isoformat()}', {
+            'periodType': 'month', 'periodStart': ms.isoformat(), 'periodEnd': me.isoformat(),
+            **_aggregate(acts),
+        })
 
-    total_duration = sum(a.get('duration', a.get('movingDuration', 0)) or 0 for a in activities)
-    total_distance = sum(a.get('distance', 0) or 0 for a in activities)
-    total_calories = sum(a.get('calories', a.get('activeKilocalories', 0)) or 0 for a in activities)
+    # ── Yearly: all years with data + current year ──
+    years = {today.year}
+    for act in all_activities:
+        yr_str = (act.get('startTimeLocal') or '')[:4]
+        if yr_str and yr_str.isdigit():
+            years.add(int(yr_str))
+    for y in sorted(years):
+        ys = date(y, 1, 1)
+        ye = date(y, 12, 31)
+        acts = _filter(ys, ye)
+        _write_stat(f'year_{y}', {
+            'periodType': 'year', 'periodStart': ys.isoformat(), 'periodEnd': ye.isoformat(),
+            **_aggregate(acts),
+        })
 
-    by_type = {}
-    for act in activities:
-        t = act.get('activityType', {}).get('typeKey', 'other') if isinstance(act.get('activityType'), dict) else 'other'
-        if t not in by_type:
-            by_type[t] = {'count': 0, 'duration': 0, 'distance': 0}
-        by_type[t]['count'] += 1
-        by_type[t]['duration'] += (act.get('duration', act.get('movingDuration', 0)) or 0)
-        by_type[t]['distance'] += (act.get('distance', 0) or 0)
-
-    db.document(f'users/{uid}/activityStats/{period_key}').set({
-        'periodType': 'week',
-        'periodStart': week_start.isoformat(),
-        'periodEnd': week_end.isoformat(),
-        'activityCount': len(activities),
-        'totalDurationSeconds': total_duration,
-        'totalDistanceMeters': total_distance,
-        'totalCalories': total_calories,
-        'byType': by_type,
-        'computedAt': firestore.SERVER_TIMESTAMP,
-    }, merge=True)
+    _flush()
+    print(f'Stats computed for {uid}: 52 weeks, 24 months, {len(years)} years')
 
 
 # ══════════════════════════════════════════════════════

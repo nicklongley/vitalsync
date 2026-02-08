@@ -51,15 +51,8 @@ export function AuthProvider({ children }) {
 
       if (firebaseUser) {
         setUser(firebaseUser);
-        // Ensure user doc exists when auth state changes
-        // (covers both popup and redirect flows)
-        try {
-          await _ensureUserSettings(firebaseUser);
-        } catch (err) {
-          console.error('Error ensuring user settings:', err);
-        }
-        // Real-time listener for user settings
         const settingsRef = doc(db, 'users', firebaseUser.uid);
+        let didInitialLoad = false;
         settingsUnsub = onSnapshot(settingsRef, (snap) => {
           if (snap.exists()) {
             setUserSettings(snap.data());
@@ -67,6 +60,15 @@ export function AuthProvider({ children }) {
             setUserSettings(null);
           }
           setLoading(false);
+          // Update profile fields AFTER first snapshot loads the full doc
+          // into the local cache. This prevents partial optimistic snapshots
+          // from overwriting existing user settings.
+          if (!didInitialLoad) {
+            didInitialLoad = true;
+            _ensureUserSettings(firebaseUser).catch((err) => {
+              console.error('Error ensuring user settings:', err);
+            });
+          }
         }, (err) => {
           console.error('Error listening to user settings:', err);
           setLoading(false);

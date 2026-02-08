@@ -64,6 +64,7 @@ export function ActionPrompt({ icon, title, subtitle, cta, ctaAction, accent = '
     amber: { border: 'border-amber-800/40', bg: 'bg-amber-950/30', text: 'text-amber-400', btn: 'bg-amber-600 hover:bg-amber-500' },
     cyan: { border: 'border-cyan-800/40', bg: 'bg-cyan-950/30', text: 'text-cyan-400', btn: 'bg-cyan-600 hover:bg-cyan-500' },
     rose: { border: 'border-rose-800/40', bg: 'bg-rose-950/30', text: 'text-rose-400', btn: 'bg-rose-600 hover:bg-rose-500' },
+    violet: { border: 'border-violet-800/40', bg: 'bg-violet-950/30', text: 'text-violet-400', btn: 'bg-violet-600 hover:bg-violet-500' },
   };
   const a = accents[accent];
   return (

@@ -87,7 +87,7 @@ export function useRecentActivities(count = 10) {
 
     const q = query(
       collection(db, 'users', user.uid, 'activities'),
-      orderBy('date', 'desc'),
+      orderBy('startTimeLocal', 'desc'),
       limit(count)
     );
 
@@ -144,6 +144,20 @@ export function useGarminSync() {
     return garminDisconnectFn();
   }
 
+  // Backfill all activity history
+  async function backfillActivities(startPage = 0) {
+    if (!user || !connected) return null;
+    const backfillFn = httpsCallable(functions, 'garmin_backfill');
+    return backfillFn({ startPage });
+  }
+
+  // Compute activity stats on demand
+  async function computeStats() {
+    if (!user) return null;
+    const statsFn = httpsCallable(functions, 'compute_stats_on_demand');
+    return statsFn();
+  }
+
   return {
     connected,
     backfillStatus,
@@ -153,6 +167,8 @@ export function useGarminSync() {
     syncNow,
     connectGarmin,
     disconnectGarmin,
+    backfillActivities,
+    computeStats,
   };
 }
 
@@ -196,7 +212,8 @@ export function useHealthLog(type = null, count = 20) {
 }
 
 // ── Activity stats (aggregated periods) ──
-export function useActivityStats(periodType = 'week', sport = 'all', count = 12) {
+// Sport filtering is done client-side using the byType field
+export function useActivityStats(periodType = 'week', count = 52) {
   const { user } = useAuth();
   const [stats, setStats] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -204,19 +221,11 @@ export function useActivityStats(periodType = 'week', sport = 'all', count = 12)
   useEffect(() => {
     if (!user) return;
 
-    const constraints = [
+    const q = query(
+      collection(db, 'users', user.uid, 'activityStats'),
       where('periodType', '==', periodType),
       orderBy('periodStart', 'desc'),
       limit(count),
-    ];
-
-    if (sport && sport !== 'all') {
-      constraints.splice(1, 0, where('sport', '==', sport));
-    }
-
-    const q = query(
-      collection(db, 'users', user.uid, 'activityStats'),
-      ...constraints
     );
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -228,7 +237,7 @@ export function useActivityStats(periodType = 'week', sport = 'all', count = 12)
     });
 
     return () => unsubscribe();
-  }, [user, periodType, sport, count]);
+  }, [user, periodType, count]);
 
   return { stats, loading };
 }
