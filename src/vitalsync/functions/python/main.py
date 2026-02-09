@@ -326,6 +326,7 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
             'heartRates': _safe_call(client.get_heart_rates, ds, default={}),
             'sleep': _safe_call(client.get_sleep_data, ds, default={}),
             'stress': _safe_call(client.get_stress_data, ds, default={}),
+            'bodyBattery': _safe_call(client.get_body_battery, ds, default=[]),
             'bodyComp': _safe_call(client.get_body_composition, ds, default={}),
             'hrv': _safe_call(client.get_hrv_data, ds, default={}),
             'spo2': _safe_call(client.get_spo2_data, ds, default={}),
@@ -358,6 +359,29 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
                 except Exception as e2:
                     print(f'Failed to write {field_name} for {ds} (even after JSON round-trip): {e2}')
                     # Last resort: skip this field entirely
+
+    # Extract latest weight from today's bodyComp and update profile
+    try:
+        today_ref = db.document(f'users/{uid}/garminDailies/{today.isoformat()}')
+        today_doc = today_ref.get()
+        if today_doc.exists:
+            body_comp = today_doc.to_dict().get('bodyComp', {})
+            weight_list = body_comp.get('dateWeightList', [])
+            if isinstance(weight_list, list) and weight_list:
+                latest = weight_list[-1] if isinstance(weight_list[-1], dict) else {}
+                weight_grams = latest.get('weight', 0)
+                if weight_grams and isinstance(weight_grams, (int, float)) and weight_grams > 0:
+                    weight_kg = round(weight_grams / 1000, 1)
+                    body_fat = latest.get('bodyFat', None)
+                    weight_update = {'weight': weight_kg, 'weightSource': 'garmin'}
+                    if body_fat and isinstance(body_fat, (int, float)) and 0 < body_fat < 100:
+                        weight_update['bodyFatPct'] = round(body_fat, 1)
+                    db.document(f'users/{uid}').set(
+                        {'profile': weight_update}, merge=True
+                    )
+                    print(f'Updated profile weight from Garmin: {weight_kg} kg')
+    except Exception as e:
+        print(f'Failed to extract weight from bodyComp: {e}')
 
     # Sync recent activities (last 20)
     activities = _safe_call(client.get_activities, 0, 20, default=[])

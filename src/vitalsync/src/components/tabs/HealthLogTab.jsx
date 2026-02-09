@@ -3,11 +3,11 @@
 // Manual health entries: weight, blood pressure, mood, notes
 // ══════════════════════════════════════════════════════
 
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
-import { useHealthLog } from '@/hooks/useGarminData';
+import { useHealthLog, useGarminWeightHistory } from '@/hooks/useGarminData';
 import { DateEntryPicker } from '@/components/shared';
 
 const ENTRY_TYPES = [
@@ -30,10 +30,29 @@ const MOOD_OPTIONS = [
 export default function HealthLogTab() {
   const { user } = useAuth();
   const { entries, loading } = useHealthLog(null, 20);
+  const { entries: garminWeights } = useGarminWeightHistory(30);
   const [activeType, setActiveType] = useState('weight');
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
+
+  // Merge manual entries with Garmin weight data for display
+  const mergedEntries = useMemo(() => {
+    const manualDates = new Set(entries.filter(e => e.type === 'weight').map(e => e.date));
+    // Add Garmin weights for dates that don't have a manual weight entry
+    const garminEntries = garminWeights
+      .filter(gw => !manualDates.has(gw.date))
+      .map(gw => ({
+        id: `garmin-${gw.date}`,
+        type: 'weight',
+        date: gw.date,
+        value: gw.value,
+        unit: 'kg',
+        bodyFat: gw.bodyFat,
+        source: 'garmin',
+      }));
+    return [...entries, ...garminEntries].sort((a, b) => b.date.localeCompare(a.date));
+  }, [entries, garminWeights]);
 
   // Form state
   const [weight, setWeight] = useState('');
@@ -369,16 +388,21 @@ export default function HealthLogTab() {
           <div className="flex justify-center py-4">
             <div className="w-6 h-6 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin" />
           </div>
-        ) : entries.length === 0 ? (
+        ) : mergedEntries.length === 0 ? (
           <p className="text-sm text-slate-500 text-center py-4">No entries yet. Start logging above.</p>
         ) : (
           <div className="space-y-2">
-            {entries.map(entry => (
+            {mergedEntries.map(entry => (
               <div key={entry.id} className="flex items-center gap-3 py-2 border-b border-slate-800/50 last:border-0">
                 <span className="text-lg">{getEntryIcon(entry.type)}</span>
                 <div className="flex-1 min-w-0">
                   <p className="text-sm text-white font-medium">{formatEntry(entry)}</p>
-                  <p className="text-[10px] text-slate-500">{entry.date}</p>
+                  <p className="text-[10px] text-slate-500">
+                    {entry.date}
+                    {entry.source === 'garmin' && (
+                      <span className="ml-1.5 px-1.5 py-0.5 rounded bg-blue-900/40 text-blue-400 text-[9px] font-medium">Garmin</span>
+                    )}
+                  </p>
                 </div>
               </div>
             ))}
@@ -396,7 +420,12 @@ function getEntryIcon(type) {
 
 function formatEntry(entry) {
   switch (entry.type) {
-    case 'weight': return `${entry.value} kg${entry.waistCm ? ` \u00B7 Waist: ${entry.waistCm} cm` : ''}`;
+    case 'weight': {
+      let s = `${entry.value} kg`;
+      if (entry.bodyFat) s += ` \u00B7 ${entry.bodyFat}% body fat`;
+      if (entry.waistCm) s += ` \u00B7 Waist: ${entry.waistCm} cm`;
+      return s;
+    }
     case 'blood_pressure': return `${entry.systolic}/${entry.diastolic} mmHg${entry.heartRate ? ` \u00B7 ${entry.heartRate} bpm` : ''}`;
     case 'mood': {
       const emoji = MOOD_OPTIONS.find(m => m.value === entry.mood)?.emoji || '';

@@ -211,6 +211,68 @@ export function useHealthLog(type = null, count = 20) {
   return { entries, loading };
 }
 
+// ── Garmin weight history (extracted from garminDailies bodyComp) ──
+export function useGarminWeightHistory(days = 30) {
+  const { user } = useAuth();
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const dateKeys = [];
+    for (let i = 0; i < days; i++) {
+      dateKeys.push(format(subDays(new Date(), i), 'yyyy-MM-dd'));
+    }
+
+    const unsubs = dateKeys.map((dateStr, idx) => {
+      const ref = doc(db, 'users', user.uid, 'garminDailies', dateStr);
+      return onSnapshot(ref, (snap) => {
+        setEntries((prev) => {
+          const next = [...prev];
+          if (snap.exists()) {
+            const bodyComp = snap.data()?.bodyComp || {};
+            const wList = bodyComp.dateWeightList;
+            if (Array.isArray(wList) && wList.length > 0) {
+              const latest = wList[wList.length - 1];
+              const weightKg = latest?.weight ? Math.round(latest.weight / 100) / 10 : null;
+              if (weightKg) {
+                next[idx] = {
+                  date: dateStr,
+                  value: weightKg,
+                  unit: 'kg',
+                  bodyFat: latest?.bodyFat || null,
+                  muscleMass: latest?.muscleMass ? Math.round(latest.muscleMass / 100) / 10 : null,
+                  bmi: latest?.bmi || null,
+                  source: 'garmin',
+                };
+              } else {
+                next[idx] = null;
+              }
+            } else {
+              next[idx] = null;
+            }
+          } else {
+            next[idx] = null;
+          }
+          return next;
+        });
+        setLoading(false);
+      }, (err) => {
+        console.error(`Error listening to garminDailies/${dateStr} for weight:`, err);
+      });
+    });
+
+    setEntries(new Array(days).fill(null));
+
+    return () => unsubs.forEach((unsub) => unsub());
+  }, [user, days]);
+
+  // Filter out nulls and return only days with weight data
+  const filtered = entries.filter(Boolean);
+  return { entries: filtered, loading };
+}
+
 // ── Activity stats (aggregated periods) ──
 // Sport filtering is done client-side using the byType field
 export function useActivityStats(periodType = 'week', count = 52) {

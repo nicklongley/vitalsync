@@ -74,17 +74,32 @@ export default function DashboardTab() {
     });
   }, [weekData]);
 
-  // HRV average from week data
+  // HRV average from week data — try multiple field paths
   const weekHRV = useMemo(() => {
     if (!weekData) return 0;
-    const vals = weekData.map(d => d.heartRates?.hrvStatus || d.sleep?.averageHRV || 0).filter(v => v > 0);
+    const vals = weekData.map(d =>
+      d.hrv?.hrvSummary?.lastNightAvg || d.hrv?.lastNightAvg || d.hrv?.weeklyAvg
+      || d.heartRates?.hrvStatus || d.sleep?.averageHRV || d.sleep?.hrvValue || 0
+    ).filter(v => v > 0);
     return vals.length > 0 ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+  }, [weekData]);
+
+  // Weight 7-day chart data from Garmin bodyComp
+  const weightChartData = useMemo(() => {
+    if (!weekData || weekData.length === 0) return [];
+    return weekData.map(day => {
+      const dayLabel = new Date(day.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' });
+      const wList = day.bodyComp?.dateWeightList;
+      const entry = Array.isArray(wList) && wList.length > 0 ? wList[wList.length - 1] : null;
+      const wKg = entry?.weight ? Math.round(entry.weight / 100) / 10 : null;
+      const fat = entry?.bodyFat || null;
+      return { day: dayLabel, weight: wKg, bodyFat: fat };
+    });
   }, [weekData]);
 
   // FTP from user settings
   const ftp = userSettings?.profile?.ftp || userSettings?.garmin?.ftp || 0;
   const weight = userSettings?.profile?.weight || 0;
-  const wkg = ftp && weight ? (ftp / weight).toFixed(2) : null;
 
   if (loading) {
     return (
@@ -101,15 +116,41 @@ export default function DashboardTab() {
   const sleep = todayData?.sleep || {};
   const stress = todayData?.stress || {};
   const bodyBattery = todayData?.bodyBattery || {};
+  const bodyComp = todayData?.bodyComp || {};
+  const hrv = todayData?.hrv || {};
 
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
   const firstName = user?.displayName?.split(' ')[0] || 'Athlete';
 
-  const bbValue = stress.bodyBatteryHigh || bodyBattery.bodyBatteryHigh || 0;
-  const sleepScore = sleep.sleepScores?.overall?.value || 0;
+  // Body Battery — try multiple known field paths from Garmin API
+  const bbValue = stress.bodyBatteryHighestValue || stress.bodyBatteryHigh
+    || bodyBattery.bodyBatteryHighestValue || bodyBattery.bodyBatteryHigh
+    || (Array.isArray(bodyBattery) && bodyBattery.length > 0
+      ? Math.max(...bodyBattery.filter(v => Array.isArray(v) && v[1] !== null).map(v => v[1] || 0))
+      : 0) || 0;
+
+  // Sleep score — try multiple known paths
+  const sleepScore = sleep.sleepScores?.overall?.value
+    || sleep.sleepScores?.overallScore || sleep.overallScore
+    || sleep.sleepScore || sleep.value || 0;
+
+  // HRV — try hrv doc, heartRates, and sleep fields
+  const todayHRV = hrv.hrvSummary?.lastNightAvg || hrv.lastNightAvg || hrv.weeklyAvg
+    || hr.hrvStatus || sleep.averageHRV || sleep.hrvValue || 0;
+
   // Readiness: composite of body battery + sleep score
   const readiness = bbValue && sleepScore ? Math.round((bbValue + sleepScore) / 2) : bbValue || sleepScore || 0;
+
+  // Weight from Garmin bodyComp or profile
+  const garminWeightList = bodyComp.dateWeightList;
+  const garminWeightEntry = Array.isArray(garminWeightList) && garminWeightList.length > 0
+    ? garminWeightList[garminWeightList.length - 1] : null;
+  const garminWeightKg = garminWeightEntry?.weight
+    ? Math.round(garminWeightEntry.weight / 100) / 10 : null; // grams → kg with 1 decimal
+  const garminBodyFat = garminWeightEntry?.bodyFat || null;
+  const currentWeight = garminWeightKg || weight || 0;
+  const wkg = ftp && currentWeight ? (ftp / currentWeight).toFixed(2) : null;
 
   function dismiss(key) {
     setDismissedPrompts(prev => [...prev, key]);
@@ -180,7 +221,7 @@ export default function DashboardTab() {
         <MetricCard
           icon={"\uD83D\uDC9A"}
           title="HRV"
-          value={weekHRV || hr.hrvStatus || '--'}
+          value={todayHRV || weekHRV || '--'}
           unit="ms"
           subtitle={weekHRV ? `Weekly avg: ${weekHRV}ms` : ''}
         />
@@ -195,6 +236,13 @@ export default function DashboardTab() {
           title="FTP"
           value={ftp ? `${ftp}W` : '--'}
           subtitle={wkg ? `${wkg} W/kg` : 'Set in Settings'}
+        />
+        <MetricCard
+          icon={"\u2696\uFE0F"}
+          title="Weight"
+          value={currentWeight ? `${currentWeight}` : '--'}
+          unit="kg"
+          subtitle={garminBodyFat ? `Body fat: ${garminBodyFat}%` : (garminWeightKg ? 'From Garmin' : '')}
         />
       </div>
 
@@ -219,10 +267,34 @@ export default function DashboardTab() {
         </div>
       )}
 
+      {/* ── Weight 7-Day Line Chart ── */}
+      {weightChartData.some(d => d.weight) && (
+        <div className="glass-card p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-wider mb-2">Weight {garminBodyFat ? '& Body Fat ' : ''}\u2014 7 Days</p>
+          <div className="h-32 mt-1">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={weightChartData}>
+                <XAxis dataKey="day" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+                <YAxis hide domain={['dataMin - 1', 'dataMax + 1']} />
+                <Tooltip
+                  contentStyle={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }}
+                  labelStyle={{ color: '#94a3b8' }}
+                  formatter={(val, name) => name === 'weight' ? [`${val} kg`, 'Weight'] : [`${val}%`, 'Body Fat']}
+                />
+                <Line type="monotone" dataKey="weight" stroke="#f59e0b" strokeWidth={2} dot={false} name="weight" connectNulls />
+                {weightChartData.some(d => d.bodyFat) && (
+                  <Line type="monotone" dataKey="bodyFat" stroke="#f472b6" strokeWidth={2} dot={false} name="bodyFat" connectNulls />
+                )}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+
       {/* ── Action Prompts ── */}
       {connected && (
         <div className="space-y-2">
-          {!dismissedPrompts.includes('weight') && (
+          {!currentWeight && !dismissedPrompts.includes('weight') && (
             <ActionPrompt
               icon={"\u2696\uFE0F"}
               title="Log your weight"
