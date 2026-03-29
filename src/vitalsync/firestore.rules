@@ -23,7 +23,7 @@ service cloud.firestore {
       allow update: if isOwner(uid)
                     // Prevent client from writing to encrypted garmin token fields
                     && !request.resource.data.diff(resource.data).affectedKeys()
-                        .hasAny(['garthSession', 'garminEmail']);
+                        .hasAny(['encrypted_tokens']);
     }
 
     // ── GARMIN DAILY DATA ──

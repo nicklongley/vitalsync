@@ -35,14 +35,14 @@ const AI_PERSONALITIES = [
 
 export default function SettingsTab() {
   const { user, userSettings, signOut } = useAuth();
-  const { connected, connectGarmin, disconnectGarmin, lastSyncAt } = useGarminSync();
+  const { connected, needsReauth, connectGarmin, disconnectGarmin, lastSyncAt } = useGarminSync();
 
-  // Garmin connection form
-  const [garminEmail, setGarminEmail] = useState('');
-  const [garminPassword, setGarminPassword] = useState('');
+  // Garmin connection form (browser token capture)
+  const [garminAccessToken, setGarminAccessToken] = useState('');
+  const [garminJwtFgp, setGarminJwtFgp] = useState('');
   const [garminLoading, setGarminLoading] = useState(false);
   const [garminError, setGarminError] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
+  const [showTokenHelp, setShowTokenHelp] = useState(false);
 
   // Export / Delete state
   const [exporting, setExporting] = useState(false);
@@ -149,20 +149,15 @@ export default function SettingsTab() {
   }, 0);
 
   async function handleGarminConnect() {
-    if (!garminEmail || !garminPassword) return;
-    // Basic email validation
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(garminEmail)) {
-      setGarminError('Please enter a valid email address');
-      return;
-    }
+    if (!garminAccessToken || !garminJwtFgp) return;
     setGarminLoading(true);
     setGarminError('');
     try {
-      await connectGarmin(garminEmail, garminPassword);
-      setGarminEmail('');
-      setGarminPassword('');
+      await connectGarmin(garminAccessToken, garminJwtFgp);
+      setGarminAccessToken('');
+      setGarminJwtFgp('');
     } catch (err) {
-      setGarminError(err.message || 'Connection failed');
+      setGarminError(err.message || 'Token validation failed');
     } finally {
       setGarminLoading(false);
     }
@@ -268,7 +263,7 @@ export default function SettingsTab() {
       {/* ── Garmin Connection ── */}
       <div className="glass-card p-5">
         <p className="text-xs text-slate-400 uppercase tracking-wider mb-3">Garmin Connection</p>
-        {connected ? (
+        {connected && !needsReauth ? (
           <div className="space-y-3">
             <div className="flex items-center gap-2">
               <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -284,31 +279,53 @@ export default function SettingsTab() {
           </div>
         ) : (
           <div className="space-y-3">
-            <p className="text-slate-400 text-xs">
-              Enter your Garmin Connect credentials. They are encrypted and stored securely.
-            </p>
-            <input type="email" placeholder="Garmin email" value={garminEmail}
-              onChange={e => setGarminEmail(e.target.value)}
-              className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm
-                         placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors" />
-            <div className="relative">
-              <input type={showPassword ? 'text' : 'password'} placeholder="Garmin password" value={garminPassword}
-                onChange={e => setGarminPassword(e.target.value)}
+            {needsReauth && (
+              <div className="bg-amber-500/10 border border-amber-600/30 rounded-xl p-3">
+                <p className="text-amber-400 text-xs font-medium">Session expired</p>
+                <p className="text-amber-400/70 text-[11px] mt-1">
+                  Your Garmin session has expired. Please re-authenticate by pasting fresh tokens below.
+                </p>
+              </div>
+            )}
+            <button onClick={() => setShowTokenHelp(!showTokenHelp)}
+              className="text-slate-400 text-xs hover:text-slate-300 transition-colors flex items-center gap-1">
+              <span>{showTokenHelp ? '\u25BC' : '\u25B6'}</span>
+              How to get your Garmin tokens
+            </button>
+            {showTokenHelp && (
+              <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3 text-[11px] text-slate-400 space-y-2">
+                <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">connect.garmin.com</span> in your browser</p>
+                <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Network tab</p>
+                <p><span className="text-white font-medium">3.</span> Click any request to connect.garmin.com and copy the <span className="text-emerald-400">Authorization</span> header value (starts with "Bearer ...")</p>
+                <p><span className="text-white font-medium">4.</span> Go to Application &gt; Cookies &gt; connect.garmin.com and copy the <span className="text-emerald-400">JWT_FGP</span> cookie value</p>
+              </div>
+            )}
+            <div>
+              <label className="text-[10px] text-slate-500 block mb-1">Access Token (JWT)</label>
+              <textarea placeholder="Paste Bearer token here..." value={garminAccessToken}
+                onChange={e => setGarminAccessToken(e.target.value)}
+                rows={3}
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm font-mono
+                           placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors resize-none" />
+            </div>
+            <div>
+              <label className="text-[10px] text-slate-500 block mb-1">JWT_FGP Cookie</label>
+              <input type="text" placeholder="e.g. b83ff82f-32a9-4f8f-..." value={garminJwtFgp}
+                onChange={e => setGarminJwtFgp(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleGarminConnect()}
-                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 pr-12 text-white text-sm
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm font-mono
                            placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors" />
-              <button onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 text-xs min-w-[44px] min-h-[44px] flex items-center justify-center">
-                {showPassword ? 'Hide' : 'Show'}
-              </button>
             </div>
             {garminError && <p className="text-rose-400 text-xs">{garminError}</p>}
             <button onClick={handleGarminConnect}
-              disabled={garminLoading || !garminEmail || !garminPassword}
+              disabled={garminLoading || !garminAccessToken || !garminJwtFgp}
               className="w-full py-3 rounded-xl text-sm font-medium bg-emerald-600 text-white
                          hover:bg-emerald-500 disabled:opacity-50 transition-colors min-h-[44px]">
-              {garminLoading ? 'Connecting...' : 'Connect Garmin'}
+              {garminLoading ? 'Validating tokens...' : needsReauth ? 'Re-authenticate' : 'Connect Garmin'}
             </button>
+            <p className="text-[10px] text-slate-600 text-center">
+              Tokens are encrypted with AES-256 and never exposed to the client.
+            </p>
           </div>
         )}
       </div>

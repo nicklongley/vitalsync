@@ -50,9 +50,9 @@ export default function OnboardingPage() {
   const [totalHours, setTotalHours] = useState(9);
   const [restDays, setRestDays] = useState(['thu']);
 
-  // Step 5: Garmin
-  const [garminEmail, setGarminEmail] = useState('');
-  const [garminPassword, setGarminPassword] = useState('');
+  // Step 5: Garmin (browser token capture)
+  const [garminAccessToken, setGarminAccessToken] = useState('');
+  const [garminJwtFgp, setGarminJwtFgp] = useState('');
   const [garminLoading, setGarminLoading] = useState(false);
   const [garminError, setGarminError] = useState('');
   const [garminConnected, setGarminConnected] = useState(false);
@@ -82,10 +82,10 @@ export default function OnboardingPage() {
     setGarminLoading(true);
     setGarminError('');
     try {
-      await connectGarmin(garminEmail, garminPassword);
+      await connectGarmin(garminAccessToken, garminJwtFgp);
       setGarminConnected(true);
     } catch (err) {
-      setGarminError(err?.details?.message || err?.message?.replace(/^.*?:\s*/, '') || 'Connection failed.');
+      setGarminError(err?.details?.message || err?.message?.replace(/^.*?:\s*/, '') || 'Token validation failed.');
     } finally {
       setGarminLoading(false);
     }
@@ -384,35 +384,46 @@ export default function OnboardingPage() {
                 <p className="text-slate-400 text-sm">
                   Connect your Garmin to automatically sync heart rate, sleep, HRV, activities, and more.
                 </p>
+                <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3 text-[11px] text-slate-400 space-y-1.5">
+                  <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">connect.garmin.com</span> in your browser</p>
+                  <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Network tab, copy the <span className="text-emerald-400">Authorization</span> header</p>
+                  <p><span className="text-white font-medium">3.</span> Go to Application &gt; Cookies, copy the <span className="text-emerald-400">JWT_FGP</span> value</p>
+                </div>
                 <form onSubmit={handleGarminConnect} className="space-y-3">
-                  <input
-                    type="email"
-                    placeholder="Garmin email"
-                    value={garminEmail}
-                    onChange={(e) => setGarminEmail(e.target.value)}
-                    disabled={garminLoading}
-                    className="input-field w-full"
-                  />
-                  <input
-                    type="password"
-                    placeholder="Garmin password"
-                    value={garminPassword}
-                    onChange={(e) => setGarminPassword(e.target.value)}
-                    disabled={garminLoading}
-                    className="input-field w-full"
-                  />
+                  <div>
+                    <label className="text-[10px] text-slate-500 block mb-1">Access Token (JWT)</label>
+                    <textarea
+                      placeholder="Paste Bearer token here..."
+                      value={garminAccessToken}
+                      onChange={(e) => setGarminAccessToken(e.target.value)}
+                      disabled={garminLoading}
+                      rows={3}
+                      className="input-field w-full font-mono resize-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-slate-500 block mb-1">JWT_FGP Cookie</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. b83ff82f-32a9-4f8f-..."
+                      value={garminJwtFgp}
+                      onChange={(e) => setGarminJwtFgp(e.target.value)}
+                      disabled={garminLoading}
+                      className="input-field w-full font-mono"
+                    />
+                  </div>
                   {garminError && <p className="text-rose-400 text-xs">{garminError}</p>}
                   <button
                     type="submit"
-                    disabled={garminLoading || !garminEmail || !garminPassword}
+                    disabled={garminLoading || !garminAccessToken || !garminJwtFgp}
                     className="btn-cta-sm w-full disabled:opacity-50 flex items-center justify-center gap-2"
                   >
                     {garminLoading && <div className="w-4 h-4 rounded-full border-2 border-midnight border-t-transparent animate-spin" />}
-                    {garminLoading ? 'Connecting...' : 'Connect Garmin'}
+                    {garminLoading ? 'Validating tokens...' : 'Connect Garmin'}
                   </button>
                 </form>
                 <p className="text-slate-600 text-[10px] text-center">
-                  Credentials are encrypted with AES-256. You can skip this and connect later in Settings.
+                  Tokens are encrypted with AES-256. You can skip this and connect later in Settings.
                 </p>
               </>
             )}

@@ -1,15 +1,15 @@
 # ══════════════════════════════════════════════════════
 # VITALSYNC — Cloud Functions (Python)
-# Garmin sync via Garth + Claude AI analysis
+# Garmin sync via browser token capture + Claude AI analysis
 # ══════════════════════════════════════════════════════
 
 import json
 import os
 import base64
+import time
 from datetime import date, timedelta, datetime
 
-import garth
-from garminconnect import Garmin
+import requests
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from firebase_functions import https_fn, scheduler_fn, options
 from firebase_admin import initialize_app, firestore, auth as fb_auth
@@ -55,11 +55,31 @@ def decrypt(ciphertext: str) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# GARMIN CLIENT HELPERS
+# GARMIN CONNECT WEB API — ENDPOINTS & HELPERS
 # ══════════════════════════════════════════════════════
 
-def _restore_client(uid: str) -> Garmin:
-    """Restore a Garmin client from encrypted Firestore session."""
+GARMIN_BASE_URL = "https://connect.garmin.com"
+GARMIN_TOKEN_REFRESH_URL = f"{GARMIN_BASE_URL}/services/auth/token/refresh"
+
+ENDPOINTS = {
+    "stats":              "usersummary-service/usersummary/daily/{guid}?calendarDate={date}",
+    "heart_rates":        "wellness-service/wellness/dailyHeartRate/{guid}?date={date}",
+    "sleep":              "wellness-service/wellness/dailySleepData/{guid}?date={date}&nonSleepBufferMinutes=60",
+    "stress":             "wellness-service/wellness/dailyStress/{date}",
+    "body_comp":          "weight-service/weight/dateRange?startDate={date}&endDate={date}",
+    "hrv":                "hrv-service/hrv/{date}",
+    "spo2":               "wellness-service/wellness/dailySpo2/{date}",
+    "respiration":        "wellness-service/wellness/dailyRespiration?date={date}",
+    "training_readiness": "metrics-service/metrics/trainingreadiness/{date}",
+    "training_status":    "metrics-service/metrics/trainingstatus/aggregated/{date}",
+    "activities":         "activitylist-service/activities/search/activities?start={start}&limit={limit}",
+    "body_battery":       "wellness-service/wellness/bodyBattery/dates/{date}?startDate={date}&endDate={date}",
+    "user_profile":       "userprofile-service/usersettings",
+}
+
+
+def _restore_tokens(uid: str) -> dict:
+    """Restore Garmin tokens from encrypted Firestore storage."""
     settings = db.document(f'users/{uid}').get().to_dict()
     garmin_cfg = settings.get('garmin', {})
 
@@ -69,74 +89,103 @@ def _restore_client(uid: str) -> Garmin:
             message='Garmin not connected',
         )
 
-    encrypted_session = garmin_cfg.get('garthSession')
-    if not encrypted_session:
+    if garmin_cfg.get('needs_reauth'):
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
-            message='Garmin session expired — please reconnect in Settings',
+            message='Garmin session expired — please re-authenticate in Settings',
         )
-    session_json = decrypt(encrypted_session)
 
-    # garth.resume() expects a directory path, not a string.
-    # Use garth.client.loads() to restore from a JSON string.
-    garth.client.loads(session_json)
+    encrypted = garmin_cfg.get('encrypted_tokens')
+    if not encrypted:
+        # Legacy user with old garthSession — flag for re-auth
+        if garmin_cfg.get('garthSession'):
+            db.document(f'users/{uid}').set({
+                'garmin': {'needs_reauth': True}
+            }, merge=True)
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            message='Garmin session expired — please re-authenticate in Settings',
+        )
 
-    client = Garmin()
-    client.garth = garth.client
-
-    # display_name is required for Garmin API URL construction.
-    # Without it, API paths contain '/None/' and return 403.
-    display_name = garmin_cfg.get('displayName')
-    if not display_name:
-        try:
-            display_name = client.get_full_name()
-        except Exception:
-            pass
-    if not display_name:
-        # Fallback: try garth profile fields
-        try:
-            profile = garth.client.profile
-            display_name = profile.get('displayName') or profile.get('userName') or profile.get('fullName')
-        except Exception:
-            pass
-    if not display_name:
-        # Last resort: fetch social profile which reliably returns displayName
-        try:
-            social = client.get_social_profile()
-            display_name = social.get('displayName') or social.get('userName')
-        except Exception:
-            pass
-    if not display_name:
-        print(f'WARNING: Could not determine display_name for {uid}, API calls may fail')
-    client.display_name = display_name
-    print(f'Restored client for {uid}, display_name={display_name}')
-
-    # Persist display_name if we found it and it wasn't stored
-    if display_name and not garmin_cfg.get('displayName'):
-        db.document(f'users/{uid}').set({
-            'garmin': {'displayName': display_name}
-        }, merge=True)
-
-    return client
+    tokens = json.loads(decrypt(encrypted))
+    tokens['user_guid'] = garmin_cfg.get('user_guid', '')
+    return tokens
 
 
-def _save_session(uid: str):
-    """Persist the (possibly refreshed) Garth session back to Firestore."""
+def _garmin_request(tokens: dict, endpoint: str, default=None):
+    """Make an authenticated GET request to the Garmin Connect web API."""
+    url = f"{GARMIN_BASE_URL}/{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {tokens['access_token']}",
+        "Cookie": f"JWT_FGP={tokens['jwt_fgp']}",
+        "DI-Backend": "connectapi.garmin.com",
+        "Accept": "application/json",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code in (401, 403):
+            print(f'Garmin API auth failed ({resp.status_code}) for {endpoint}')
+            return default
+        if resp.status_code == 204 or not resp.content:
+            return default
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f'Garmin API call failed for {endpoint}: {e}')
+        return default
+
+
+def _refresh_tokens(tokens: dict) -> dict | None:
+    """Attempt to refresh Garmin JWT tokens. Returns new tokens dict or None."""
+    try:
+        resp = requests.post(
+            GARMIN_TOKEN_REFRESH_URL,
+            headers={
+                "Authorization": f"Bearer {tokens['access_token']}",
+                "Cookie": f"JWT_FGP={tokens['jwt_fgp']}",
+                "Origin": "https://connect.garmin.com",
+                "Referer": "https://connect.garmin.com/",
+                "DI-Backend": "connectapi.garmin.com",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            print(f'Token refresh failed: {resp.status_code}')
+            return None
+
+        body = resp.json() if resp.content else {}
+        new_jwt = body.get('access_token') or body.get('token') or tokens['access_token']
+
+        # JWT_FGP may be rotated in Set-Cookie header
+        new_fgp = tokens['jwt_fgp']
+        for cookie in resp.cookies:
+            if cookie.name == 'JWT_FGP':
+                new_fgp = cookie.value
+
+        return {
+            'access_token': new_jwt,
+            'refresh_token': body.get('refresh_token', tokens.get('refresh_token', '')),
+            'jwt_fgp': new_fgp,
+        }
+    except Exception as e:
+        print(f'Token refresh error: {e}')
+        return None
+
+
+def _save_tokens(uid: str, tokens: dict):
+    """Persist (possibly refreshed) tokens back to Firestore."""
+    token_data = {
+        'access_token': tokens['access_token'],
+        'refresh_token': tokens.get('refresh_token', ''),
+        'jwt_fgp': tokens['jwt_fgp'],
+    }
     db.document(f'users/{uid}').set({
         'garmin': {
-            'garthSession': encrypt(garth.client.dumps()),
-            'lastSyncAt': firestore.SERVER_TIMESTAMP,
+            'encrypted_tokens': encrypt(json.dumps(token_data)),
+            'last_sync_at': firestore.SERVER_TIMESTAMP,
+            'last_refresh_at': firestore.SERVER_TIMESTAMP,
         }
     }, merge=True)
-
-
-def _safe_call(fn, *args, default=None):
-    """Call a Garmin API method, returning default on error."""
-    try:
-        return fn(*args)
-    except Exception as e:
-        print(f'API call failed for {fn.__name__}: {e}')
-        return default
 
 
 def _sanitize_for_firestore(data, max_depth=10):
@@ -195,8 +244,8 @@ def _sanitize_for_firestore(data, max_depth=10):
 # ══════════════════════════════════════════════════════
 
 @https_fn.on_call(region=REGION, memory=options.MemoryOption.GB_1, timeout_sec=540, secrets=[GARMIN_KEY_SECRET])
-def garmin_login(req: https_fn.CallableRequest) -> dict:
-    """Authenticate with Garmin Connect via Garth (same flow as mobile app)."""
+def garmin_store_tokens(req: https_fn.CallableRequest) -> dict:
+    """Store browser-captured Garmin JWT tokens and start initial sync."""
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
@@ -204,53 +253,48 @@ def garmin_login(req: https_fn.CallableRequest) -> dict:
         )
     uid = req.auth.uid
 
-    email = req.data.get('email', '')
-    password = req.data.get('password', '')
-    if not email or not password:
+    access_token = (req.data.get('access_token') or '').strip()
+    jwt_fgp = (req.data.get('jwt_fgp') or '').strip()
+    if not access_token or not jwt_fgp:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-            message='Email and password required',
+            message='Access token and JWT_FGP cookie are required',
         )
 
+    tokens = {'access_token': access_token, 'jwt_fgp': jwt_fgp, 'refresh_token': ''}
+
     try:
-        garth.login(email, password)
+        # Validate tokens by fetching user profile
+        profile = _garmin_request(tokens, ENDPOINTS['user_profile'])
+        if not profile:
+            raise https_fn.HttpsError(
+                code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+                message='Invalid tokens — could not reach Garmin API. Please check your tokens and try again.',
+            )
 
-        # Verify by fetching profile
-        client = Garmin()
-        client.garth = garth.client
-        display_name = client.get_full_name()
-        if not display_name:
-            # Fallback: try garth profile or social profile
-            try:
-                profile = garth.client.profile
-                display_name = profile.get('displayName') or profile.get('userName') or profile.get('fullName')
-            except Exception:
-                pass
-        if not display_name:
-            try:
-                social = client.get_social_profile()
-                display_name = social.get('displayName') or social.get('userName')
-            except Exception:
-                pass
-        client.display_name = display_name
+        user_guid = str(profile.get('userProfileNumber', '') or profile.get('displayName', '') or '')
+        display_name = profile.get('displayName') or profile.get('userName') or ''
 
-        # Persist encrypted session
+        # Persist encrypted tokens
         db.document(f'users/{uid}').set({
             'garmin': {
                 'connected': True,
-                'garthSession': encrypt(garth.client.dumps()),
-                'garminEmail': encrypt(email),
+                'encrypted_tokens': encrypt(json.dumps(tokens)),
+                'user_guid': user_guid,
+                'displayName': display_name,
+                'needs_reauth': False,
+                'token_captured_at': firestore.SERVER_TIMESTAMP,
                 'connectedAt': firestore.SERVER_TIMESTAMP,
-                'lastSyncAt': None,
+                'last_sync_at': None,
+                'last_refresh_at': None,
                 'backfillStatus': 'syncing',
                 'backfillProgress': 0,
-                'displayName': display_name,
             }
         }, merge=True)
 
         # Kick off initial sync (first 30 days + today)
-        _do_sync(uid, client, backfill_days=30)
-        _save_session(uid)
+        _do_sync(uid, tokens, backfill_days=30)
+        _save_tokens(uid, tokens)
 
         # Mark initial backfill as complete (30 days done)
         db.document(f'users/{uid}').set({
@@ -262,17 +306,13 @@ def garmin_login(req: https_fn.CallableRequest) -> dict:
 
         return {'status': 'connected', 'displayName': display_name}
 
+    except https_fn.HttpsError:
+        raise
     except Exception as e:
-        msg = str(e)
-        if 'MFA' in msg or 'mfa' in msg:
-            raise https_fn.HttpsError(
-                code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
-                message='Garmin MFA required — please disable MFA or provide code',
-            )
-        print(f'Garmin login failed for {uid}: {msg}')
+        print(f'Garmin token store failed for {uid}: {e}')
         raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
-            message='Garmin login failed. Please check your credentials and try again.',
+            code=https_fn.FunctionsErrorCode.INTERNAL,
+            message='Failed to connect Garmin. Please try again.',
         )
 
 
@@ -295,8 +335,11 @@ def garmin_disconnect(req: https_fn.CallableRequest) -> dict:
     # which prevents DELETE_FIELD from working as expected.
     db.document(f'users/{uid}').update({
         'garmin.connected': False,
-        'garmin.garthSession': firestore.DELETE_FIELD,
-        'garmin.garminEmail': firestore.DELETE_FIELD,
+        'garmin.encrypted_tokens': firestore.DELETE_FIELD,
+        'garmin.user_guid': firestore.DELETE_FIELD,
+        'garmin.needs_reauth': firestore.DELETE_FIELD,
+        'garmin.token_captured_at': firestore.DELETE_FIELD,
+        'garmin.last_refresh_at': firestore.DELETE_FIELD,
         'garmin.disconnectedAt': firestore.SERVER_TIMESTAMP,
     })
 
@@ -307,32 +350,50 @@ def garmin_disconnect(req: https_fn.CallableRequest) -> dict:
 # GARMIN DATA SYNC — CORE PULL LOGIC
 # ══════════════════════════════════════════════════════
 
-def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
+def _do_sync(uid: str, tokens: dict, backfill_days: int = 1):
     """
     Pull Garmin data for the last N days and write to Firestore.
     backfill_days=1 for daily sync, 30 for initial, 730 for full backfill.
     Each daily document is written individually so one bad field
     doesn't block the rest.
     """
+    guid = tokens.get('user_guid', '')
+
+    # Attempt token refresh before making data calls
+    refreshed = _refresh_tokens(tokens)
+    if refreshed:
+        tokens.update(refreshed)
+
     today = date.today()
+    auth_failed = False
 
     for i in range(backfill_days):
         d = today - timedelta(days=i)
         ds = d.isoformat()
 
-        # Fetch each data source individually
+        # Fetch each data source individually via direct HTTP
         data_sources = {
-            'stats': _safe_call(client.get_stats, ds, default={}),
-            'heartRates': _safe_call(client.get_heart_rates, ds, default={}),
-            'sleep': _safe_call(client.get_sleep_data, ds, default={}),
-            'stress': _safe_call(client.get_stress_data, ds, default={}),
-            'bodyBattery': _safe_call(client.get_body_battery, ds, default=[]),
-            'bodyComp': _safe_call(client.get_body_composition, ds, default={}),
-            'hrv': _safe_call(client.get_hrv_data, ds, default={}),
-            'spo2': _safe_call(client.get_spo2_data, ds, default={}),
-            'respiration': _safe_call(client.get_respiration_data, ds, default={}),
-            'trainingReadiness': _safe_call(client.get_training_readiness, ds, default={}),
+            'stats': _garmin_request(tokens, ENDPOINTS['stats'].format(guid=guid, date=ds), default={}),
+            'heartRates': _garmin_request(tokens, ENDPOINTS['heart_rates'].format(guid=guid, date=ds), default={}),
+            'sleep': _garmin_request(tokens, ENDPOINTS['sleep'].format(guid=guid, date=ds), default={}),
+            'stress': _garmin_request(tokens, ENDPOINTS['stress'].format(date=ds), default={}),
+            'bodyBattery': _garmin_request(tokens, ENDPOINTS['body_battery'].format(date=ds), default=[]),
+            'bodyComp': _garmin_request(tokens, ENDPOINTS['body_comp'].format(date=ds), default={}),
+            'hrv': _garmin_request(tokens, ENDPOINTS['hrv'].format(date=ds), default={}),
+            'spo2': _garmin_request(tokens, ENDPOINTS['spo2'].format(date=ds), default={}),
+            'respiration': _garmin_request(tokens, ENDPOINTS['respiration'].format(date=ds), default={}),
+            'trainingReadiness': _garmin_request(tokens, ENDPOINTS['training_readiness'].format(date=ds), default={}),
         }
+
+        # Check if most requests returned defaults (auth may have failed)
+        empty_count = sum(1 for v in data_sources.values() if v in ({}, []))
+        if empty_count >= 8 and i == 0:
+            # Almost everything empty on first day — likely auth failure
+            auth_failed = True
+
+        # Brief pause between days to avoid rate limiting
+        if i < backfill_days - 1:
+            time.sleep(0.3)
 
         ref = db.document(f'users/{uid}/garminDailies/{ds}')
 
@@ -383,8 +444,14 @@ def _do_sync(uid: str, client: Garmin, backfill_days: int = 1):
     except Exception as e:
         print(f'Failed to extract weight from bodyComp: {e}')
 
+    # Flag for re-auth if auth appears to have failed
+    if auth_failed:
+        db.document(f'users/{uid}').set({
+            'garmin': {'needs_reauth': True}
+        }, merge=True)
+
     # Sync recent activities (last 20)
-    activities = _safe_call(client.get_activities, 0, 20, default=[])
+    activities = _garmin_request(tokens, ENDPOINTS['activities'].format(start=0, limit=20), default=[])
     batch = db.batch()
     write_count = 0
     for act in (activities or []):
@@ -423,9 +490,9 @@ def garmin_sync_on_demand(req: https_fn.CallableRequest) -> dict:
         )
     uid = req.auth.uid
 
-    client = _restore_client(uid)
-    _do_sync(uid, client, backfill_days=2)  # Today + yesterday
-    _save_session(uid)
+    tokens = _restore_tokens(uid)
+    _do_sync(uid, tokens, backfill_days=2)  # Today + yesterday
+    _save_tokens(uid, tokens)
 
     return {'status': 'ok', 'syncedAt': datetime.utcnow().isoformat()}
 
@@ -451,9 +518,9 @@ def garmin_scheduled_sync(event: scheduler_fn.ScheduledEvent) -> None:
     for user_doc in users_ref.stream():
         uid = user_doc.id
         try:
-            client = _restore_client(uid)
-            _do_sync(uid, client, backfill_days=1)
-            _save_session(uid)
+            tokens = _restore_tokens(uid)
+            _do_sync(uid, tokens, backfill_days=1)
+            _save_tokens(uid, tokens)
         except Exception as e:
             print(f'Sync failed for {uid}: {e}')
             # Don't fail the whole batch — continue to next user
@@ -491,8 +558,8 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
     PAGE_SIZE = 100
     MAX_PAGES_PER_CALL = 50  # 5000 activities per invocation (within 9-min timeout)
 
-    client = _restore_client(uid)
-    print(f'Backfill started for {uid}, display_name={client.display_name}, startPage={start_page}')
+    tokens = _restore_tokens(uid)
+    print(f'Backfill started for {uid}, startPage={start_page}')
 
     db.document(f'users/{uid}').set({
         'garmin': {'backfillStatus': 'syncing'}
@@ -504,7 +571,7 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
 
     while found_activities and page < start_page + MAX_PAGES_PER_CALL:
         print(f'Fetching activities page {page} (offset={page * PAGE_SIZE}, limit={PAGE_SIZE})')
-        acts = _safe_call(client.get_activities, page * PAGE_SIZE, PAGE_SIZE, default=[])
+        acts = _garmin_request(tokens, ENDPOINTS['activities'].format(start=page * PAGE_SIZE, limit=PAGE_SIZE), default=[])
         print(f'Got {len(acts) if acts else 0} activities from page {page}')
         if not acts:
             found_activities = False
@@ -547,7 +614,7 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
         if len(acts) < PAGE_SIZE:
             found_activities = False
 
-    _save_session(uid)
+    _save_tokens(uid, tokens)
 
     has_more = found_activities  # True if we hit the per-call page limit
 
@@ -1121,8 +1188,7 @@ def data_export(req: https_fn.CallableRequest) -> dict:
     if user_doc.exists:
         settings = user_doc.to_dict()
         garmin = settings.get('garmin', {})
-        garmin.pop('garthSession', None)
-        garmin.pop('garminEmail', None)
+        garmin.pop('encrypted_tokens', None)
         settings['garmin'] = garmin
         export['settings'] = settings
 

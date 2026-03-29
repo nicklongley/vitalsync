@@ -112,9 +112,10 @@ export function useGarminSync() {
 
   const garmin = userSettings?.garmin || {};
   const connected = garmin.connected || false;
+  const needsReauth = garmin.needs_reauth || false;
   const backfillStatus = garmin.backfillStatus || 'idle';
   const backfillProgress = garmin.backfillProgress || 0;
-  const lastSyncAt = garmin.lastSyncAt?.toDate?.() || null;
+  const lastSyncAt = garmin.last_sync_at?.toDate?.() || garmin.lastSyncAt?.toDate?.() || null;
 
   // Trigger on-demand sync
   async function syncNow() {
@@ -130,11 +131,11 @@ export function useGarminSync() {
     }
   }
 
-  // Connect Garmin account
-  async function connectGarmin(email, password) {
+  // Connect Garmin account via browser token capture
+  async function connectGarmin(accessToken, jwtFgp) {
     if (!user) throw new Error('Must be signed in');
-    const garminLoginFn = httpsCallable(functions, 'garmin_login');
-    return garminLoginFn({ email, password });
+    const storeTokensFn = httpsCallable(functions, 'garmin_store_tokens');
+    return storeTokensFn({ access_token: accessToken, jwt_fgp: jwtFgp });
   }
 
   // Disconnect Garmin
@@ -160,6 +161,7 @@ export function useGarminSync() {
 
   return {
     connected,
+    needsReauth,
     backfillStatus,
     backfillProgress,
     lastSyncAt,
