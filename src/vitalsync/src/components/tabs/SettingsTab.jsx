@@ -43,6 +43,17 @@ export default function SettingsTab() {
   const [garminError, setGarminError] = useState('');
   const [showTokenHelp, setShowTokenHelp] = useState(false);
 
+  // Listen for cookies from the VitalSync Chrome extension
+  useEffect(() => {
+    function handleExtensionCookies(e) {
+      if (e.detail?.cookieHeader) {
+        setGarminCookieHeader(e.detail.cookieHeader);
+      }
+    }
+    window.addEventListener('vitalsync-garmin-cookies', handleExtensionCookies);
+    return () => window.removeEventListener('vitalsync-garmin-cookies', handleExtensionCookies);
+  }, []);
+
   // Export / Delete state
   const [exporting, setExporting] = useState(false);
   const [deleting, setDeleting] = useState(false);

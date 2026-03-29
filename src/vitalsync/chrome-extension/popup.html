@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0F172A;
+      color: #E2E8F0;
+      padding: 20px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      color: #fff;
+    }
+    .header .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10B981;
+    }
+    .status {
+      font-size: 12px;
+      color: #94A3B8;
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
+    .status.error { color: #F87171; }
+    .status.success { color: #34D399; }
+    .btn {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-primary {
+      background: #059669;
+      color: white;
+    }
+    .btn-primary:hover { background: #10B981; }
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn-copy {
+      background: #1E293B;
+      color: #94A3B8;
+      border: 1px solid #334155;
+      margin-top: 8px;
+    }
+    .btn-copy:hover { background: #334155; color: #E2E8F0; }
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: white;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .footer {
+      margin-top: 16px;
+      font-size: 10px;
+      color: #475569;
+      text-align: center;
+    }
+    .step-indicator {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding: 10px;
+      background: #1E293B;
+      border-radius: 8px;
+      border: 1px solid #334155;
+    }
+    .step-icon {
+      font-size: 18px;
+      flex-shrink: 0;
+    }
+    .step-text {
+      font-size: 11px;
+      color: #94A3B8;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="dot"></div>
+    <h1>VitalSync</h1>
+  </div>
+
+  <div id="content">
+    <div class="step-indicator">
+      <span class="step-icon" id="garmin-status-icon">&#x231A;</span>
+      <span class="step-text" id="garmin-status">Checking Garmin Connect session...</span>
+    </div>
+
+    <button class="btn btn-primary" id="connect-btn" disabled>
+      Connect to VitalSync
+    </button>
+    <button class="btn btn-copy" id="copy-btn" style="display:none">
+      Copy cookies to clipboard
+    </button>
+
+    <p class="status" id="status"></p>
+  </div>
+
+  <div class="footer">
+    Cookies are encrypted with AES-256 before storage
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
