@@ -131,11 +131,11 @@ export function useGarminSync() {
     }
   }
 
-  // Connect Garmin account via browser session cookie capture
-  async function connectGarmin(sessionCookie, garminGuid) {
+  // Connect Garmin account via browser cookie header capture
+  async function connectGarmin(cookieHeader) {
     if (!user) throw new Error('Must be signed in');
     const storeTokensFn = httpsCallable(functions, 'garmin_store_tokens');
-    return storeTokensFn({ session_cookie: sessionCookie, garmin_guid: garminGuid });
+    return storeTokensFn({ cookie_header: cookieHeader });
   }
 
   // Disconnect Garmin

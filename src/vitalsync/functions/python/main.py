@@ -111,17 +111,13 @@ def _restore_tokens(uid: str) -> dict:
     return tokens
 
 
-def _build_cookie_header(tokens: dict) -> str:
-    """Build the cookie header from stored session tokens."""
-    return f"GARMIN-SSO=1; GARMIN-SSO-CUST-GUID={tokens.get('user_guid', '')}; session={tokens['session_cookie']}"
-
-
 def _garmin_request(tokens: dict, endpoint: str, default=None):
     """Make an authenticated GET request to the Garmin Connect web API."""
     url = f"{GARMIN_BASE_URL}/{endpoint}"
     headers = {
-        "Cookie": _build_cookie_header(tokens),
+        "Cookie": tokens['cookie_header'],
         "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     }
     try:
         resp = requests.get(url, headers=headers, timeout=30)
@@ -140,7 +136,7 @@ def _garmin_request(tokens: dict, endpoint: str, default=None):
 def _save_tokens(uid: str, tokens: dict):
     """Persist tokens and update sync timestamp in Firestore."""
     token_data = {
-        'session_cookie': tokens['session_cookie'],
+        'cookie_header': tokens['cookie_header'],
     }
     db.document(f'users/{uid}').set({
         'garmin': {
@@ -216,15 +212,14 @@ def garmin_store_tokens(req: https_fn.CallableRequest) -> dict:
         )
     uid = req.auth.uid
 
-    session_cookie = (req.data.get('session_cookie') or '').strip()
-    garmin_guid = (req.data.get('garmin_guid') or '').strip()
-    if not session_cookie:
+    cookie_header = (req.data.get('cookie_header') or '').strip()
+    if not cookie_header:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-            message='Session cookie is required',
+            message='Cookie header is required',
         )
 
-    tokens = {'session_cookie': session_cookie, 'user_guid': garmin_guid}
+    tokens = {'cookie_header': cookie_header}
 
     try:
         # Validate tokens by fetching user profile
@@ -235,18 +230,16 @@ def garmin_store_tokens(req: https_fn.CallableRequest) -> dict:
                 message='Invalid tokens — could not reach Garmin API. Please check your tokens and try again.',
             )
 
-        # Extract GUID from profile if not provided
-        if not garmin_guid:
-            garmin_guid = str(profile.get('userProfileNumber', '') or '')
-            tokens['user_guid'] = garmin_guid
+        user_guid = str(profile.get('userProfileNumber', '') or '')
+        tokens['user_guid'] = user_guid
         display_name = profile.get('displayName') or profile.get('userName') or ''
 
-        # Persist encrypted session cookie
+        # Persist encrypted cookie header
         db.document(f'users/{uid}').set({
             'garmin': {
                 'connected': True,
-                'encrypted_tokens': encrypt(json.dumps({'session_cookie': session_cookie})),
-                'user_guid': garmin_guid,
+                'encrypted_tokens': encrypt(json.dumps({'cookie_header': cookie_header})),
+                'user_guid': user_guid,
                 'displayName': display_name,
                 'needs_reauth': False,
                 'token_captured_at': firestore.SERVER_TIMESTAMP,

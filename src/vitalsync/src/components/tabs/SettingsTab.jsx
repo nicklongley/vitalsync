@@ -37,9 +37,8 @@ export default function SettingsTab() {
   const { user, userSettings, signOut } = useAuth();
   const { connected, needsReauth, connectGarmin, disconnectGarmin, lastSyncAt } = useGarminSync();
 
-  // Garmin connection form (browser session cookie capture)
-  const [garminSessionCookie, setGarminSessionCookie] = useState('');
-  const [garminGuid, setGarminGuid] = useState('');
+  // Garmin connection form (browser cookie capture)
+  const [garminCookieHeader, setGarminCookieHeader] = useState('');
   const [garminLoading, setGarminLoading] = useState(false);
   const [garminError, setGarminError] = useState('');
   const [showTokenHelp, setShowTokenHelp] = useState(false);
@@ -149,13 +148,12 @@ export default function SettingsTab() {
   }, 0);
 
   async function handleGarminConnect() {
-    if (!garminSessionCookie) return;
+    if (!garminCookieHeader) return;
     setGarminLoading(true);
     setGarminError('');
     try {
-      await connectGarmin(garminSessionCookie, garminGuid);
-      setGarminSessionCookie('');
-      setGarminGuid('');
+      await connectGarmin(garminCookieHeader);
+      setGarminCookieHeader('');
     } catch (err) {
       setGarminError(err.message || 'Session validation failed');
     } finally {
@@ -290,41 +288,34 @@ export default function SettingsTab() {
             <button onClick={() => setShowTokenHelp(!showTokenHelp)}
               className="text-slate-400 text-xs hover:text-slate-300 transition-colors flex items-center gap-1">
               <span>{showTokenHelp ? '\u25BC' : '\u25B6'}</span>
-              How to get your Garmin session
+              How to get your Garmin cookies
             </button>
             {showTokenHelp && (
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3 text-[11px] text-slate-400 space-y-2">
                 <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">connect.garmin.com</span> in your browser</p>
-                <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Application &gt; Cookies &gt; connect.garmin.com</p>
-                <p><span className="text-white font-medium">3.</span> Find the <span className="text-emerald-400">session</span> cookie and copy its value (starts with "Fe26.2...")</p>
-                <p><span className="text-white font-medium">4.</span> Find the <span className="text-emerald-400">GARMIN-SSO-CUST-GUID</span> cookie and copy its value</p>
+                <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Network tab</p>
+                <p><span className="text-white font-medium">3.</span> Click any request to connect.garmin.com</p>
+                <p><span className="text-white font-medium">4.</span> In the Headers tab, find <span className="text-emerald-400">cookie:</span> under Request Headers</p>
+                <p><span className="text-white font-medium">5.</span> Right-click the cookie value &gt; Copy value</p>
               </div>
             )}
             <div>
-              <label className="text-[10px] text-slate-500 block mb-1">Session Cookie</label>
-              <textarea placeholder='Paste session cookie value (starts with "Fe26.2...")' value={garminSessionCookie}
-                onChange={e => setGarminSessionCookie(e.target.value)}
-                rows={3}
+              <label className="text-[10px] text-slate-500 block mb-1">Cookie Header</label>
+              <textarea placeholder="Paste the full cookie header value from DevTools..." value={garminCookieHeader}
+                onChange={e => setGarminCookieHeader(e.target.value)}
+                rows={4}
                 className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm font-mono
                            placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors resize-none" />
             </div>
-            <div>
-              <label className="text-[10px] text-slate-500 block mb-1">GARMIN-SSO-CUST-GUID</label>
-              <input type="text" placeholder="e.g. e92a7ae3-15ed-48b9-..." value={garminGuid}
-                onChange={e => setGarminGuid(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && handleGarminConnect()}
-                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm font-mono
-                           placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors" />
-            </div>
             {garminError && <p className="text-rose-400 text-xs">{garminError}</p>}
             <button onClick={handleGarminConnect}
-              disabled={garminLoading || !garminSessionCookie}
+              disabled={garminLoading || !garminCookieHeader}
               className="w-full py-3 rounded-xl text-sm font-medium bg-emerald-600 text-white
                          hover:bg-emerald-500 disabled:opacity-50 transition-colors min-h-[44px]">
               {garminLoading ? 'Validating session...' : needsReauth ? 'Re-authenticate' : 'Connect Garmin'}
             </button>
             <p className="text-[10px] text-slate-600 text-center">
-              Session data is encrypted with AES-256 and never exposed to the client.
+              Cookie data is encrypted with AES-256 and never exposed to the client.
             </p>
           </div>
         )}

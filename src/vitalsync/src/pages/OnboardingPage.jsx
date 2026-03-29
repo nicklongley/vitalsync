@@ -50,9 +50,8 @@ export default function OnboardingPage() {
   const [totalHours, setTotalHours] = useState(9);
   const [restDays, setRestDays] = useState(['thu']);
 
-  // Step 5: Garmin (browser session cookie capture)
-  const [garminSessionCookie, setGarminSessionCookie] = useState('');
-  const [garminGuid, setGarminGuid] = useState('');
+  // Step 5: Garmin (browser cookie capture)
+  const [garminCookieHeader, setGarminCookieHeader] = useState('');
   const [garminLoading, setGarminLoading] = useState(false);
   const [garminError, setGarminError] = useState('');
   const [garminConnected, setGarminConnected] = useState(false);
@@ -82,7 +81,7 @@ export default function OnboardingPage() {
     setGarminLoading(true);
     setGarminError('');
     try {
-      await connectGarmin(garminSessionCookie, garminGuid);
+      await connectGarmin(garminCookieHeader);
       setGarminConnected(true);
     } catch (err) {
       setGarminError(err?.details?.message || err?.message?.replace(/^.*?:\s*/, '') || 'Token validation failed.');
@@ -386,36 +385,25 @@ export default function OnboardingPage() {
                 </p>
                 <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3 text-[11px] text-slate-400 space-y-1.5">
                   <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">connect.garmin.com</span> in your browser</p>
-                  <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Application &gt; Cookies &gt; connect.garmin.com</p>
-                  <p><span className="text-white font-medium">3.</span> Copy the <span className="text-emerald-400">session</span> and <span className="text-emerald-400">GARMIN-SSO-CUST-GUID</span> cookie values</p>
+                  <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Network tab, click any request</p>
+                  <p><span className="text-white font-medium">3.</span> Copy the full <span className="text-emerald-400">cookie:</span> value from Request Headers</p>
                 </div>
                 <form onSubmit={handleGarminConnect} className="space-y-3">
                   <div>
-                    <label className="text-[10px] text-slate-500 block mb-1">Session Cookie</label>
+                    <label className="text-[10px] text-slate-500 block mb-1">Cookie Header</label>
                     <textarea
-                      placeholder='Paste session cookie value (starts with "Fe26.2...")'
-                      value={garminSessionCookie}
-                      onChange={(e) => setGarminSessionCookie(e.target.value)}
+                      placeholder="Paste the full cookie header value from DevTools..."
+                      value={garminCookieHeader}
+                      onChange={(e) => setGarminCookieHeader(e.target.value)}
                       disabled={garminLoading}
-                      rows={3}
+                      rows={4}
                       className="input-field w-full font-mono resize-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[10px] text-slate-500 block mb-1">GARMIN-SSO-CUST-GUID</label>
-                    <input
-                      type="text"
-                      placeholder="e.g. e92a7ae3-15ed-48b9-..."
-                      value={garminGuid}
-                      onChange={(e) => setGarminGuid(e.target.value)}
-                      disabled={garminLoading}
-                      className="input-field w-full font-mono"
                     />
                   </div>
                   {garminError && <p className="text-rose-400 text-xs">{garminError}</p>}
                   <button
                     type="submit"
-                    disabled={garminLoading || !garminSessionCookie}
+                    disabled={garminLoading || !garminCookieHeader}
                     className="btn-cta-sm w-full disabled:opacity-50 flex items-center justify-center gap-2"
                   >
                     {garminLoading && <div className="w-4 h-4 rounded-full border-2 border-midnight border-t-transparent animate-spin" />}
@@ -423,7 +411,7 @@ export default function OnboardingPage() {
                   </button>
                 </form>
                 <p className="text-slate-600 text-[10px] text-center">
-                  Session data is encrypted with AES-256. You can skip this and connect later in Settings.
+                  Cookie data is encrypted with AES-256. You can skip this and connect later in Settings.
                 </p>
               </>
             )}
