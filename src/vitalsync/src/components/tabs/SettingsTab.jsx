@@ -37,9 +37,9 @@ export default function SettingsTab() {
   const { user, userSettings, signOut } = useAuth();
   const { connected, needsReauth, connectGarmin, disconnectGarmin, lastSyncAt } = useGarminSync();
 
-  // Garmin connection form (browser token capture)
-  const [garminAccessToken, setGarminAccessToken] = useState('');
-  const [garminJwtFgp, setGarminJwtFgp] = useState('');
+  // Garmin connection form (browser session cookie capture)
+  const [garminSessionCookie, setGarminSessionCookie] = useState('');
+  const [garminGuid, setGarminGuid] = useState('');
   const [garminLoading, setGarminLoading] = useState(false);
   const [garminError, setGarminError] = useState('');
   const [showTokenHelp, setShowTokenHelp] = useState(false);
@@ -149,15 +149,15 @@ export default function SettingsTab() {
   }, 0);
 
   async function handleGarminConnect() {
-    if (!garminAccessToken || !garminJwtFgp) return;
+    if (!garminSessionCookie) return;
     setGarminLoading(true);
     setGarminError('');
     try {
-      await connectGarmin(garminAccessToken, garminJwtFgp);
-      setGarminAccessToken('');
-      setGarminJwtFgp('');
+      await connectGarmin(garminSessionCookie, garminGuid);
+      setGarminSessionCookie('');
+      setGarminGuid('');
     } catch (err) {
-      setGarminError(err.message || 'Token validation failed');
+      setGarminError(err.message || 'Session validation failed');
     } finally {
       setGarminLoading(false);
     }
@@ -290,41 +290,41 @@ export default function SettingsTab() {
             <button onClick={() => setShowTokenHelp(!showTokenHelp)}
               className="text-slate-400 text-xs hover:text-slate-300 transition-colors flex items-center gap-1">
               <span>{showTokenHelp ? '\u25BC' : '\u25B6'}</span>
-              How to get your Garmin tokens
+              How to get your Garmin session
             </button>
             {showTokenHelp && (
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3 text-[11px] text-slate-400 space-y-2">
                 <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">connect.garmin.com</span> in your browser</p>
-                <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Network tab</p>
-                <p><span className="text-white font-medium">3.</span> Click any request to connect.garmin.com and copy the <span className="text-emerald-400">Authorization</span> header value (starts with "Bearer ...")</p>
-                <p><span className="text-white font-medium">4.</span> Go to Application &gt; Cookies &gt; connect.garmin.com and copy the <span className="text-emerald-400">JWT_FGP</span> cookie value</p>
+                <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Application &gt; Cookies &gt; connect.garmin.com</p>
+                <p><span className="text-white font-medium">3.</span> Find the <span className="text-emerald-400">session</span> cookie and copy its value (starts with "Fe26.2...")</p>
+                <p><span className="text-white font-medium">4.</span> Find the <span className="text-emerald-400">GARMIN-SSO-CUST-GUID</span> cookie and copy its value</p>
               </div>
             )}
             <div>
-              <label className="text-[10px] text-slate-500 block mb-1">Access Token (JWT)</label>
-              <textarea placeholder="Paste Bearer token here..." value={garminAccessToken}
-                onChange={e => setGarminAccessToken(e.target.value)}
+              <label className="text-[10px] text-slate-500 block mb-1">Session Cookie</label>
+              <textarea placeholder='Paste session cookie value (starts with "Fe26.2...")' value={garminSessionCookie}
+                onChange={e => setGarminSessionCookie(e.target.value)}
                 rows={3}
                 className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm font-mono
                            placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors resize-none" />
             </div>
             <div>
-              <label className="text-[10px] text-slate-500 block mb-1">JWT_FGP Cookie</label>
-              <input type="text" placeholder="e.g. b83ff82f-32a9-4f8f-..." value={garminJwtFgp}
-                onChange={e => setGarminJwtFgp(e.target.value)}
+              <label className="text-[10px] text-slate-500 block mb-1">GARMIN-SSO-CUST-GUID</label>
+              <input type="text" placeholder="e.g. e92a7ae3-15ed-48b9-..." value={garminGuid}
+                onChange={e => setGarminGuid(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleGarminConnect()}
                 className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm font-mono
                            placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors" />
             </div>
             {garminError && <p className="text-rose-400 text-xs">{garminError}</p>}
             <button onClick={handleGarminConnect}
-              disabled={garminLoading || !garminAccessToken || !garminJwtFgp}
+              disabled={garminLoading || !garminSessionCookie}
               className="w-full py-3 rounded-xl text-sm font-medium bg-emerald-600 text-white
                          hover:bg-emerald-500 disabled:opacity-50 transition-colors min-h-[44px]">
-              {garminLoading ? 'Validating tokens...' : needsReauth ? 'Re-authenticate' : 'Connect Garmin'}
+              {garminLoading ? 'Validating session...' : needsReauth ? 'Re-authenticate' : 'Connect Garmin'}
             </button>
             <p className="text-[10px] text-slate-600 text-center">
-              Tokens are encrypted with AES-256 and never exposed to the client.
+              Session data is encrypted with AES-256 and never exposed to the client.
             </p>
           </div>
         )}

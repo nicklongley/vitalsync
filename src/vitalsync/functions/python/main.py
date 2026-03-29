@@ -59,22 +59,21 @@ def decrypt(ciphertext: str) -> str:
 # ══════════════════════════════════════════════════════
 
 GARMIN_BASE_URL = "https://connect.garmin.com"
-GARMIN_TOKEN_REFRESH_URL = f"{GARMIN_BASE_URL}/services/auth/token/refresh"
 
 ENDPOINTS = {
-    "stats":              "usersummary-service/usersummary/daily/{guid}?calendarDate={date}",
-    "heart_rates":        "wellness-service/wellness/dailyHeartRate/{guid}?date={date}",
-    "sleep":              "wellness-service/wellness/dailySleepData/{guid}?date={date}&nonSleepBufferMinutes=60",
-    "stress":             "wellness-service/wellness/dailyStress/{date}",
-    "body_comp":          "weight-service/weight/dateRange?startDate={date}&endDate={date}",
-    "hrv":                "hrv-service/hrv/{date}",
-    "spo2":               "wellness-service/wellness/dailySpo2/{date}",
-    "respiration":        "wellness-service/wellness/dailyRespiration?date={date}",
-    "training_readiness": "metrics-service/metrics/trainingreadiness/{date}",
-    "training_status":    "metrics-service/metrics/trainingstatus/aggregated/{date}",
-    "activities":         "activitylist-service/activities/search/activities?start={start}&limit={limit}",
-    "body_battery":       "wellness-service/wellness/bodyBattery/dates/{date}?startDate={date}&endDate={date}",
-    "user_profile":       "userprofile-service/usersettings",
+    "stats":              "gc-api/usersummary-service/usersummary/daily/{guid}?calendarDate={date}",
+    "heart_rates":        "gc-api/wellness-service/wellness/dailyHeartRate/{guid}?date={date}",
+    "sleep":              "gc-api/wellness-service/wellness/dailySleepData/{guid}?date={date}&nonSleepBufferMinutes=60",
+    "stress":             "gc-api/wellness-service/wellness/dailyStress/{date}",
+    "body_comp":          "gc-api/weight-service/weight/dateRange?startDate={date}&endDate={date}",
+    "hrv":                "gc-api/hrv-service/hrv/{date}",
+    "spo2":               "gc-api/wellness-service/wellness/dailySpo2/{date}",
+    "respiration":        "gc-api/wellness-service/wellness/dailyRespiration?date={date}",
+    "training_readiness": "gc-api/metrics-service/metrics/trainingreadiness/{date}",
+    "training_status":    "gc-api/metrics-service/metrics/trainingstatus/aggregated/{date}",
+    "activities":         "gc-api/activitylist-service/activities/search/activities?start={start}&limit={limit}",
+    "body_battery":       "gc-api/wellness-service/wellness/bodyBattery/dates/{date}?startDate={date}&endDate={date}",
+    "user_profile":       "gc-api/userprofile-service/userprofile/user-settings/",
 }
 
 
@@ -112,13 +111,16 @@ def _restore_tokens(uid: str) -> dict:
     return tokens
 
 
+def _build_cookie_header(tokens: dict) -> str:
+    """Build the cookie header from stored session tokens."""
+    return f"GARMIN-SSO=1; GARMIN-SSO-CUST-GUID={tokens.get('user_guid', '')}; session={tokens['session_cookie']}"
+
+
 def _garmin_request(tokens: dict, endpoint: str, default=None):
     """Make an authenticated GET request to the Garmin Connect web API."""
     url = f"{GARMIN_BASE_URL}/{endpoint}"
     headers = {
-        "Authorization": f"Bearer {tokens['access_token']}",
-        "Cookie": f"JWT_FGP={tokens['jwt_fgp']}",
-        "DI-Backend": "connectapi.garmin.com",
+        "Cookie": _build_cookie_header(tokens),
         "Accept": "application/json",
     }
     try:
@@ -135,49 +137,10 @@ def _garmin_request(tokens: dict, endpoint: str, default=None):
         return default
 
 
-def _refresh_tokens(tokens: dict) -> dict | None:
-    """Attempt to refresh Garmin JWT tokens. Returns new tokens dict or None."""
-    try:
-        resp = requests.post(
-            GARMIN_TOKEN_REFRESH_URL,
-            headers={
-                "Authorization": f"Bearer {tokens['access_token']}",
-                "Cookie": f"JWT_FGP={tokens['jwt_fgp']}",
-                "Origin": "https://connect.garmin.com",
-                "Referer": "https://connect.garmin.com/",
-                "DI-Backend": "connectapi.garmin.com",
-            },
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            print(f'Token refresh failed: {resp.status_code}')
-            return None
-
-        body = resp.json() if resp.content else {}
-        new_jwt = body.get('access_token') or body.get('token') or tokens['access_token']
-
-        # JWT_FGP may be rotated in Set-Cookie header
-        new_fgp = tokens['jwt_fgp']
-        for cookie in resp.cookies:
-            if cookie.name == 'JWT_FGP':
-                new_fgp = cookie.value
-
-        return {
-            'access_token': new_jwt,
-            'refresh_token': body.get('refresh_token', tokens.get('refresh_token', '')),
-            'jwt_fgp': new_fgp,
-        }
-    except Exception as e:
-        print(f'Token refresh error: {e}')
-        return None
-
-
 def _save_tokens(uid: str, tokens: dict):
-    """Persist (possibly refreshed) tokens back to Firestore."""
+    """Persist tokens and update sync timestamp in Firestore."""
     token_data = {
-        'access_token': tokens['access_token'],
-        'refresh_token': tokens.get('refresh_token', ''),
-        'jwt_fgp': tokens['jwt_fgp'],
+        'session_cookie': tokens['session_cookie'],
     }
     db.document(f'users/{uid}').set({
         'garmin': {
@@ -253,15 +216,15 @@ def garmin_store_tokens(req: https_fn.CallableRequest) -> dict:
         )
     uid = req.auth.uid
 
-    access_token = (req.data.get('access_token') or '').strip()
-    jwt_fgp = (req.data.get('jwt_fgp') or '').strip()
-    if not access_token or not jwt_fgp:
+    session_cookie = (req.data.get('session_cookie') or '').strip()
+    garmin_guid = (req.data.get('garmin_guid') or '').strip()
+    if not session_cookie:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-            message='Access token and JWT_FGP cookie are required',
+            message='Session cookie is required',
         )
 
-    tokens = {'access_token': access_token, 'jwt_fgp': jwt_fgp, 'refresh_token': ''}
+    tokens = {'session_cookie': session_cookie, 'user_guid': garmin_guid}
 
     try:
         # Validate tokens by fetching user profile
@@ -272,15 +235,18 @@ def garmin_store_tokens(req: https_fn.CallableRequest) -> dict:
                 message='Invalid tokens — could not reach Garmin API. Please check your tokens and try again.',
             )
 
-        user_guid = str(profile.get('userProfileNumber', '') or profile.get('displayName', '') or '')
+        # Extract GUID from profile if not provided
+        if not garmin_guid:
+            garmin_guid = str(profile.get('userProfileNumber', '') or '')
+            tokens['user_guid'] = garmin_guid
         display_name = profile.get('displayName') or profile.get('userName') or ''
 
-        # Persist encrypted tokens
+        # Persist encrypted session cookie
         db.document(f'users/{uid}').set({
             'garmin': {
                 'connected': True,
-                'encrypted_tokens': encrypt(json.dumps(tokens)),
-                'user_guid': user_guid,
+                'encrypted_tokens': encrypt(json.dumps({'session_cookie': session_cookie})),
+                'user_guid': garmin_guid,
                 'displayName': display_name,
                 'needs_reauth': False,
                 'token_captured_at': firestore.SERVER_TIMESTAMP,
@@ -358,12 +324,6 @@ def _do_sync(uid: str, tokens: dict, backfill_days: int = 1):
     doesn't block the rest.
     """
     guid = tokens.get('user_guid', '')
-
-    # Attempt token refresh before making data calls
-    refreshed = _refresh_tokens(tokens)
-    if refreshed:
-        tokens.update(refreshed)
-
     today = date.today()
     auth_failed = False
 
