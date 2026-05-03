@@ -27,6 +27,7 @@ export default function TrainingTab() {
   const [adjustModalOpen, setAdjustModalOpen] = useState(false);
   const [adjusting, setAdjusting] = useState(false);
   const [adjustResult, setAdjustResult] = useState('');
+  const [selectedPlanId, setSelectedPlanId] = useState(null);
 
   // Listen to training plans
   useEffect(() => {
@@ -127,6 +128,8 @@ export default function TrainingTab() {
 
   const currentPlan = plans[0];
   const pastPlans = plans.slice(1);
+  const viewedPlan = selectedPlanId ? plans.find(p => p.id === selectedPlanId) : currentPlan;
+  const isViewingPast = !!(selectedPlanId && viewedPlan && viewedPlan.id !== currentPlan?.id);
 
   return (
     <div className="space-y-4">
@@ -303,17 +306,21 @@ export default function TrainingTab() {
         </div>
       )}
 
-      {/* Past plans */}
-      {pastPlans.length > 0 && (
+      {/* Past plans — clickable; hidden while viewing one */}
+      {!isViewingPast && pastPlans.length > 0 && (
         <div>
           <p className="text-xs text-slate-400 uppercase tracking-wider mb-2">Previous Plans</p>
           <div className="space-y-2">
             {pastPlans.map(plan => (
-              <div key={plan.id} className="glass-card p-3">
-                <div className="flex items-center justify-between">
-                  <div>
+              <button
+                key={plan.id}
+                onClick={() => setSelectedPlanId(plan.id)}
+                className="w-full glass-card p-3 text-left hover:bg-slate-800/30 transition-colors min-h-[44px]"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0 flex-1">
                     <p className="text-xs text-white font-medium">
-                      {plan.weekStartDate} - {plan.weekEndDate}
+                      {plan.weekStartDate} – {plan.weekEndDate}
                     </p>
                     <p className="text-[10px] text-slate-500">
                       {plan.sessions?.filter(s => s.completed).length || 0}/{plan.sessions?.length || 0} completed
@@ -322,8 +329,9 @@ export default function TrainingTab() {
                   {plan.totalPlannedMinutes && (
                     <p className="text-xs font-mono text-slate-400">{Math.round(plan.totalPlannedMinutes / 60)}h</p>
                   )}
+                  <span className="text-slate-600 text-xs">›</span>
                 </div>
-              </div>
+              </button>
             ))}
           </div>
         </div>
