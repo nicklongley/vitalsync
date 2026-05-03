@@ -1287,14 +1287,24 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
         )
     uid = req.auth.uid
 
+    user_context_text = (req.data.get('context') or '').strip() if req.data else ''
+    user_context_text = user_context_text[:2000]  # cap
+
     context = _build_daily_context(uid)
     client = _get_anthropic_client()
+
+    user_message = json.dumps(context, default=str)
+    if user_context_text:
+        user_message = (
+            f'USER CONTEXT FOR THIS WEEK (treat as hard constraints):\n{user_context_text}\n\n'
+            f'TRAINING DATA:\n{user_message}'
+        )
 
     response = client.messages.create(
         model='claude-sonnet-4-5-20250929',
         max_tokens=3000,
         system=WEEKLY_PLAN_PROMPT,
-        messages=[{'role': 'user', 'content': json.dumps(context, default=str)}],
+        messages=[{'role': 'user', 'content': user_message}],
     )
 
     result = _parse_ai_json(response.content[0].text)
@@ -1317,9 +1327,16 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
         'focusAreas': result.get('focusAreas', []),
         'totalPlannedMinutes': result.get('totalPlannedMinutes', 0),
         'sessions': sessions,
+        'userContext': user_context_text or None,
         'createdAt': firestore.SERVER_TIMESTAMP,
         'generatedBy': 'claude-sonnet-4-5-20250929',
     })
+
+    # Persist last-used context so the next Generate modal can prefill it
+    if user_context_text:
+        db.document(f'users/{uid}').set({
+            'lastPlanContext': user_context_text,
+        }, merge=True)
 
     return {
         'status': 'ok',

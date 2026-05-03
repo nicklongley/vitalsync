@@ -9,11 +9,12 @@ import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
 import { useIntervalsSync } from '@/hooks/useIntervalsData';
+import WeeklyPlanContextModal from '@/components/WeeklyPlanContextModal';
 
 const DAY_LABELS = { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday' };
 
 export default function TrainingTab() {
-  const { user } = useAuth();
+  const { user, userSettings } = useAuth();
   const { connected: intervalsConnected, pushPlan } = useIntervalsSync();
   const [plans, setPlans] = useState([]);
   const [loadingPlans, setLoadingPlans] = useState(true);
@@ -21,6 +22,7 @@ export default function TrainingTab() {
   const [pushing, setPushing] = useState(false);
   const [pushResult, setPushResult] = useState('');
   const [error, setError] = useState('');
+  const [contextModalOpen, setContextModalOpen] = useState(false);
 
   // Listen to training plans
   useEffect(() => {
@@ -43,12 +45,18 @@ export default function TrainingTab() {
     return () => unsub();
   }, [user]);
 
-  async function generatePlan() {
+  async function handleGenerateClick() {
+    setError('');
+    setContextModalOpen(true);
+  }
+
+  async function generatePlan(contextText) {
     setGenerating(true);
     setError('');
     try {
       const fn = httpsCallable(functions, 'ai_weekly_plan');
-      await fn();
+      await fn({ context: contextText || '' });
+      setContextModalOpen(false);
     } catch (err) {
       console.error('Plan generation failed:', err);
       setError(err.message || 'Failed to generate plan.');
@@ -97,10 +105,17 @@ export default function TrainingTab() {
 
   return (
     <div className="space-y-4">
+      <WeeklyPlanContextModal
+        open={contextModalOpen}
+        initialContext={userSettings?.lastPlanContext || ''}
+        onCancel={() => { if (!generating) setContextModalOpen(false); }}
+        onSubmit={generatePlan}
+        generating={generating}
+      />
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-bold text-white">Training Plan</h2>
         <button
-          onClick={generatePlan}
+          onClick={handleGenerateClick}
           disabled={generating}
           className="px-4 py-2 rounded-xl text-xs font-medium bg-emerald-600/20 border border-emerald-700/50
                      text-emerald-400 hover:bg-emerald-600/30 disabled:opacity-50 transition-colors"
@@ -240,7 +255,7 @@ export default function TrainingTab() {
             Generate an AI-powered weekly training plan based on your intervals.icu data, goals, and availability.
           </p>
           <button
-            onClick={generatePlan}
+            onClick={handleGenerateClick}
             disabled={generating}
             className="px-6 py-2.5 rounded-xl text-sm font-medium bg-emerald-600 text-white
                        hover:bg-emerald-500 disabled:opacity-50 transition-colors"
