@@ -110,9 +110,27 @@ export default function ActivityDetail({ activityId, onBack }) {
     return () => { cancelled = true; };
   }, [intervalsId, connected]);
 
+  // Compute peaks from streams as a reliable fallback when detail-endpoint maxes are missing.
+  const streamPeaks = useMemo(() => {
+    const out = {};
+    if (streams?.watts?.length) {
+      const max = streams.watts.reduce((m, v) => (v > m ? v : m), 0);
+      if (max > 0) out.maxPower = max;
+    }
+    if (streams?.heartrate?.length) {
+      const max = streams.heartrate.reduce((m, v) => (v > m ? v : m), 0);
+      if (max > 0) out.maxHR = max;
+    }
+    return out;
+  }, [streams]);
+
   // Merge fresh intervals.icu detail (if loaded) into the displayed activity, since
-  // the synced summary in Firestore may lack some power/HR fields.
-  const display = useMemo(() => mergeDetail(activity, freshDetail), [activity, freshDetail]);
+  // the synced summary in Firestore may lack some power/HR fields. Stream-derived
+  // peaks override when present (most reliable).
+  const display = useMemo(
+    () => mergeDetail(activity, freshDetail, streamPeaks),
+    [activity, freshDetail, streamPeaks]
+  );
 
   // Down-sample streams to <= 300 points for charting
   const chartData = useMemo(() => {
@@ -196,14 +214,11 @@ export default function ActivityDetail({ activityId, onBack }) {
         )}
       </div>
 
-      {/* Stats grid */}
+      {/* Stats grid — power before HR when present (cycling-primary view) */}
       <div className="grid grid-cols-3 gap-2">
         <Stat label="Duration" value={durationStr} />
         <Stat label="Distance" value={distanceKm ? `${distanceKm} km` : '--'} />
         <Stat label="Elevation" value={display.elevationGain ? `${Math.round(display.elevationGain)} m` : '--'} />
-        <Stat label="Avg HR" value={display.averageHR ? `${Math.round(display.averageHR)} bpm` : '--'} />
-        <Stat label="Max HR" value={display.maxHR ? `${Math.round(display.maxHR)} bpm` : '--'} />
-        <Stat label="Calories" value={display.calories ? `${display.calories} kcal` : '--'} />
         {(display.averagePower || display.normalizedPower || display.maxPower) && (
           <>
             <Stat label="Avg Power" value={display.averagePower ? `${Math.round(display.averagePower)} W` : '--'} />
@@ -211,6 +226,9 @@ export default function ActivityDetail({ activityId, onBack }) {
             <Stat label="Max Power" value={display.maxPower ? `${Math.round(display.maxPower)} W` : '--'} />
           </>
         )}
+        <Stat label="Avg HR" value={display.averageHR ? `${Math.round(display.averageHR)} bpm` : '--'} />
+        <Stat label="Max HR" value={display.maxHR ? `${Math.round(display.maxHR)} bpm` : '--'} />
+        <Stat label="Calories" value={display.calories ? `${display.calories} kcal` : '--'} />
         {(display.tss || display.intensityFactor) && (
           <>
             <Stat label="Training Load" value={display.tss ? Math.round(display.tss) : '--'} />
@@ -282,36 +300,36 @@ function BackButton({ onBack }) {
 
 // Merge fresh intervals.icu detail (raw field names) into the persisted Firestore
 // activity (Garmin-shape names). Detail wins where present.
-function mergeDetail(activity, detail) {
+function mergeDetail(activity, detail, streamPeaks = {}) {
   if (!activity) return null;
-  if (!detail) return activity;
   const pick = (...vals) => vals.find(v => v !== undefined && v !== null && v !== 0 && v !== '');
-  const joules = detail.icu_joules;
-  const kj = detail.kilojoules;
-  const calories = detail.calories
+  const d = detail || {};
+  const joules = d.icu_joules;
+  const kj = d.kilojoules;
+  const calories = d.calories
     ?? (kj ? Math.round(kj / 4.184) : (joules ? Math.round(joules / 4184) : activity.calories));
   return {
     ...activity,
-    activityName: pick(detail.name, activity.activityName),
-    description: pick(detail.description, activity.description),
-    startTimeLocal: pick(detail.start_date_local, activity.startTimeLocal),
-    duration: pick(detail.elapsed_time, activity.duration),
-    movingDuration: pick(detail.moving_time, activity.movingDuration),
-    distance: pick(detail.distance, activity.distance),
-    elevationGain: pick(detail.total_elevation_gain, activity.elevationGain),
+    activityName: pick(d.name, activity.activityName),
+    description: pick(d.description, activity.description),
+    startTimeLocal: pick(d.start_date_local, activity.startTimeLocal),
+    duration: pick(d.elapsed_time, activity.duration),
+    movingDuration: pick(d.moving_time, activity.movingDuration),
+    distance: pick(d.distance, activity.distance),
+    elevationGain: pick(d.total_elevation_gain, activity.elevationGain),
     calories,
-    averageHR: pick(detail.average_heartrate, detail.icu_average_heartrate, activity.averageHR),
-    maxHR: pick(detail.max_heartrate, activity.maxHR),
-    averagePower: pick(detail.average_watts, detail.icu_average_watts, activity.averagePower),
-    normalizedPower: pick(detail.icu_weighted_avg_watts, detail.weighted_average_watts, activity.normalizedPower),
-    maxPower: pick(detail.max_watts, activity.maxPower),
-    averageCadence: pick(detail.average_cadence, activity.averageCadence),
-    averageSpeed: pick(detail.average_speed, activity.averageSpeed),
-    maxSpeed: pick(detail.max_speed, activity.maxSpeed),
-    tss: pick(detail.icu_training_load, activity.tss),
-    intensityFactor: pick(detail.icu_intensity, activity.intensityFactor),
-    deviceName: pick(detail.device_name, activity.deviceName),
-    sourceClient: pick(detail.oauth_client_name, activity.sourceClient),
+    averageHR: pick(d.average_heartrate, d.icu_average_heartrate, activity.averageHR),
+    maxHR: pick(streamPeaks.maxHR, d.max_heartrate, d.icu_max_heartrate, activity.maxHR),
+    averagePower: pick(d.average_watts, d.icu_average_watts, activity.averagePower),
+    normalizedPower: pick(d.icu_weighted_avg_watts, d.weighted_average_watts, activity.normalizedPower),
+    maxPower: pick(streamPeaks.maxPower, d.max_watts, d.icu_max_watts, activity.maxPower),
+    averageCadence: pick(d.average_cadence, activity.averageCadence),
+    averageSpeed: pick(d.average_speed, activity.averageSpeed),
+    maxSpeed: pick(d.max_speed, activity.maxSpeed),
+    tss: pick(d.icu_training_load, activity.tss),
+    intensityFactor: pick(d.icu_intensity, activity.intensityFactor),
+    deviceName: pick(d.device_name, activity.deviceName),
+    sourceClient: pick(d.oauth_client_name, activity.sourceClient),
   };
 }
 
