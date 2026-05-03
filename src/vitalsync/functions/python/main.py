@@ -1920,6 +1920,278 @@ def ai_compile_training_focus(req: https_fn.CallableRequest) -> dict:
     return {'status': 'ok', 'fileId': 'training_focus', 'characters': len(content)}
 
 
+def _activity_history_by_week(uid: str, weeks: int = 12) -> list:
+    """Last N weeks of activity stats, oldest-first. Useful for me-file synthesis."""
+    q = (
+        db.collection(f'users/{uid}/activityStats')
+        .where(filter=google.cloud.firestore.FieldFilter('periodType', '==', 'week'))
+        .order_by('periodStart', direction='DESCENDING')
+        .limit(weeks)
+    )
+    out = []
+    for doc_snap in q.stream():
+        d = doc_snap.to_dict() or {}
+        out.append({
+            'weekStart': d.get('periodStart'),
+            'totalHours': round((d.get('totalDurationSeconds') or 0) / 3600, 1),
+            'totalKm': round((d.get('totalDistanceMeters') or 0) / 1000),
+            'activityCount': d.get('activityCount'),
+            'byType': {
+                t: {
+                    'count': v.get('count'),
+                    'hours': round((v.get('duration') or 0) / 3600, 1),
+                }
+                for t, v in (d.get('byType') or {}).items()
+            },
+        })
+    return list(reversed(out))
+
+
+def _ftp_samples_from_activities(uid: str, days: int = 180) -> list:
+    """Recent ftpAtTime values from activities to show FTP progression."""
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    q = (
+        db.collection(f'users/{uid}/activities')
+        .order_by('startTimeLocal', direction='DESCENDING')
+        .limit(200)
+    )
+    samples = []
+    seen_ftps = set()
+    for doc_snap in q.stream():
+        d = doc_snap.to_dict() or {}
+        start = (d.get('startTimeLocal') or '')[:10]
+        if start < cutoff:
+            continue
+        ftp = d.get('ftpAtTime')
+        if ftp and (start, ftp) not in seen_ftps:
+            samples.append({'date': start, 'ftp': ftp})
+            seen_ftps.add((start, ftp))
+    # Keep only ~12 distinct samples spaced over the window for the prompt
+    if len(samples) > 12:
+        step = len(samples) // 12
+        samples = samples[::step]
+    return samples
+
+
+def _wellness_summary(uid: str, days: int = 60) -> dict:
+    """Aggregate wellness over N days into ranges + recent values for me-file synthesis."""
+    today = date.today()
+    sleeps, rhrs, hrvs, weights = [], [], [], []
+    sleep_scores = []
+    for i in range(days):
+        d = (today - timedelta(days=i)).isoformat()
+        snap = db.document(f'users/{uid}/wellnessDaily/{d}').get()
+        if not snap.exists:
+            continue
+        w = snap.to_dict() or {}
+        if w.get('sleepSecs'):
+            sleeps.append(round(w['sleepSecs'] / 3600, 1))
+        if w.get('sleepScore'):
+            sleep_scores.append(int(w['sleepScore']))
+        if w.get('restingHR'):
+            rhrs.append(int(w['restingHR']))
+        v = w.get('hrv') or w.get('hrvSDNN')
+        if v:
+            hrvs.append(int(v))
+        if w.get('weight'):
+            weights.append(round(float(w['weight']), 1))
+
+    def _stats(vals):
+        if not vals:
+            return None
+        return {
+            'min': min(vals),
+            'max': max(vals),
+            'avg': round(sum(vals) / len(vals), 1),
+            'samples': len(vals),
+        }
+
+    return {
+        'days': days,
+        'sleepHours': _stats(sleeps),
+        'sleepScore': _stats(sleep_scores),
+        'restingHR': _stats(rhrs),
+        'hrv': _stats(hrvs),
+        'weight': _stats(weights),
+    }
+
+
+TRAINING_ME_PROMPT = """You compile a personal `training.me.md` file capturing the athlete's
+DURABLE training identity — what kind of athlete they are, slow-moving truths that change
+quarterly at most. Output GitHub-flavored markdown only. No code fences around the whole
+document. No preamble. Follow the EXACT section structure.
+
+OUTPUT FORMAT:
+# Training Identity: {NAME}
+## What kind of athlete I am
+## Physiological baseline
+## Long-arc goals
+## Training constraints
+## How I respond to training
+## Why I do this
+## Last updated: {DATE}
+
+PRINCIPLES:
+- The athlete may train across MULTIPLE sports — read their captured `sports` answer and
+  treat the file as plural-sport. Do not default to cycling unless they said so.
+- "What kind of athlete I am" — synthesise from captured `bestSelf`, captured `whySport`,
+  and the activityHistoryByWeek pattern (which sports dominate, consistency vs sporadic,
+  volume trend over months). 2-4 sentences. Concrete, not generic.
+- "Physiological baseline" — FTP (current and trend from ftpSamples), threshold HR, max HR,
+  resting HR baseline, weight range from wellnessSummary. Talk ranges, not single readings.
+  Note when intervals.icu auto-updated values are recent vs stale.
+- "Long-arc goals" — from captured `longArcGoals` and `currentTarget`. 2-3 bullets.
+- "Training constraints" — from captured `lifePatterns`, `equipmentTerrain`, `workArounds`,
+  `timeBudget`. Concrete things that don't change much.
+- "How I respond to training" — captured `responsePatterns` is primary input. Augment
+  briefly with anything obvious from the activityHistoryByWeek pattern (e.g. consistent
+  ramp without breakdown suggests good volume tolerance).
+- "Why I do this" — captured `whySport`. Quote or paraphrase as appropriate.
+- Total under 1500 words. Consumed by AI assistants, not humans.
+- No fabrication. If captured context is empty for a section, say "Not yet captured" rather
+  than invent.
+- If `previousFile` is provided, treat it as a starting point: preserve what still holds,
+  refresh what has changed, drop what is superseded. Don't rewrite identical content."""
+
+
+HEALTH_ME_PROMPT = """You compile a personal `health.me.md` file capturing the athlete's
+DURABLE health identity. Output markdown only. No code fences. No preamble. EXACT structure.
+
+OUTPUT FORMAT:
+# Health Identity: {NAME}
+## Baseline metrics
+## Sleep patterns
+## Recovery patterns
+## Long-arc health priorities
+## Last updated: {DATE}
+
+PRINCIPLES:
+- This file changes QUARTERLY at most.
+- "Baseline metrics" — RHR range, HRV baseline (rMSSD or SDNN), weight range, sleep score
+  range. Use the wellnessSummary stats. Talk ranges (e.g. "RHR baseline 48-54bpm") rather
+  than single readings.
+- "Sleep patterns" — captured `goodSleep` is primary. Augment with average sleep hours and
+  sleep score from wellnessSummary. Describe what good sleep looks like for THIS person.
+- "Recovery patterns" — captured `sleepResponse` and `recoveryFactors`. How they respond
+  to poor sleep, what affects their recovery.
+- "Long-arc health priorities" — captured `longArcHealth`. 2-3 priorities, concrete.
+- Total under 1200 words.
+- No fabrication. If a captured field is empty, omit or say "Not yet captured."
+- If `previousFile` is provided, refine rather than rewrite."""
+
+
+def _existing_file_content(uid: str, file_id: str) -> str | None:
+    snap = db.document(f'users/{uid}/aiContext/{file_id}').get()
+    if not snap.exists:
+        return None
+    return (snap.to_dict() or {}).get('content')
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.GB_1,
+    timeout_sec=300,
+    secrets=[ANTHROPIC_KEY_SECRET],
+)
+def ai_compile_training_me(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    name = _name_for(uid)
+    today_iso = date.today().isoformat()
+    user_doc = db.document(f'users/{uid}').get().to_dict() or {}
+    profile = user_doc.get('profile') or {}
+    capture = _capture_for(uid, 'training')
+    history = _activity_history_by_week(uid, weeks=12)
+    ftp_samples = _ftp_samples_from_activities(uid, days=180)
+    wellness_summary = _wellness_summary(uid, days=60)
+    previous = _existing_file_content(uid, 'training_me')
+
+    payload = {
+        'name': name,
+        'today': today_iso,
+        'profile': {
+            'ftp': profile.get('ftp'),
+            'thresholdHR': profile.get('thresholdHR'),
+            'maxHR': profile.get('maxHR'),
+            'restingHR': profile.get('restingHR'),
+            'weight': profile.get('weight'),
+            'age': profile.get('age'),
+            'gender': profile.get('gender'),
+        },
+        'capturedContext': capture,
+        'activityHistoryByWeek': history,
+        'ftpSamples': ftp_samples,
+        'wellnessSummary': wellness_summary,
+        'previousFile': previous,
+    }
+
+    client = _get_anthropic_client()
+    response = client.messages.create(
+        model='claude-sonnet-4-5-20250929',
+        max_tokens=3000,
+        system=TRAINING_ME_PROMPT.replace('{NAME}', name).replace('{DATE}', today_iso),
+        messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
+    )
+    content = response.content[0].text.strip()
+    _persist_ai_context_file(uid, 'training_me', 'training', 'me', content)
+    return {'status': 'ok', 'fileId': 'training_me', 'characters': len(content)}
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.GB_1,
+    timeout_sec=300,
+    secrets=[ANTHROPIC_KEY_SECRET],
+)
+def ai_compile_health_me(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    name = _name_for(uid)
+    today_iso = date.today().isoformat()
+    user_doc = db.document(f'users/{uid}').get().to_dict() or {}
+    profile = user_doc.get('profile') or {}
+    capture = _capture_for(uid, 'health')
+    wellness_summary = _wellness_summary(uid, days=60)
+    previous = _existing_file_content(uid, 'health_me')
+
+    payload = {
+        'name': name,
+        'today': today_iso,
+        'profile': {
+            'restingHR': profile.get('restingHR'),
+            'maxHR': profile.get('maxHR'),
+            'weight': profile.get('weight'),
+            'age': profile.get('age'),
+            'gender': profile.get('gender'),
+            'height': profile.get('height'),
+        },
+        'capturedContext': capture,
+        'wellnessSummary': wellness_summary,
+        'previousFile': previous,
+    }
+
+    client = _get_anthropic_client()
+    response = client.messages.create(
+        model='claude-sonnet-4-5-20250929',
+        max_tokens=2500,
+        system=HEALTH_ME_PROMPT.replace('{NAME}', name).replace('{DATE}', today_iso),
+        messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
+    )
+    content = response.content[0].text.strip()
+    _persist_ai_context_file(uid, 'health_me', 'health', 'me', content)
+    return {'status': 'ok', 'fileId': 'health_me', 'characters': len(content)}
+
+
 @https_fn.on_call(
     region=REGION,
     memory=options.MemoryOption.MB_512,

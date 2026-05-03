@@ -24,7 +24,7 @@ const DOMAINS = [
     sections: TRAINING_QUESTIONS,
     files: [
       { id: 'training_focus', label: 'training.focus.md', kind: 'focus', fn: 'ai_compile_training_focus', enabled: true },
-      { id: 'training_me', label: 'training.me.md', kind: 'me', fn: 'ai_compile_training_me', enabled: false },
+      { id: 'training_me', label: 'training.me.md', kind: 'me', fn: 'ai_compile_training_me', enabled: true },
     ],
   },
   {
@@ -34,7 +34,7 @@ const DOMAINS = [
     sections: HEALTH_QUESTIONS,
     files: [
       { id: 'health_focus', label: 'health.focus.md', kind: 'focus', fn: 'ai_compile_health_focus', enabled: true },
-      { id: 'health_me', label: 'health.me.md', kind: 'me', fn: 'ai_compile_health_me', enabled: false },
+      { id: 'health_me', label: 'health.me.md', kind: 'me', fn: 'ai_compile_health_me', enabled: true },
     ],
   },
 ];
