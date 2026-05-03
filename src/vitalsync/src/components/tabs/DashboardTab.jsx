@@ -10,7 +10,7 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import { db } from '@/lib/firebase';
-import { useTodayWellness, useWeekWellness, useIntervalsSync, useRecentActivities } from '@/hooks/useIntervalsData';
+import { useTodayWellness, useWeekWellness, useIntervalsSync, useRecentActivities, useHealthLog } from '@/hooks/useIntervalsData';
 import { useAuth } from '@/contexts/AuthContext';
 import { useNavigation } from '@/contexts/NavigationContext';
 import { GaugeRing, MetricCard, ActionPrompt, InterventionCard } from '@/components/shared';
@@ -79,6 +79,7 @@ export default function DashboardTab() {
   const { data: weekData } = useWeekWellness();
   const { connected, backfillStatus, backfillProgress, syncing, syncNow, lastSyncAt } = useIntervalsSync();
   const { activities } = useRecentActivities(50);
+  const { entries: moodEntries } = useHealthLog('mood', 3);
   const [dismissedPrompts, setDismissedPrompts] = useState([]);
   const [interventions, setInterventions] = useState([]);
   const [loadingInterventions, setLoadingInterventions] = useState(true);
@@ -198,6 +199,15 @@ export default function DashboardTab() {
   const activeDisplay = weekTotals.minutes >= 60
     ? { value: (weekTotals.minutes / 60).toFixed(1), unit: 'h' }
     : { value: weekTotals.minutes || 0, unit: 'min' };
+
+  // Hide the mood check-in prompt if user has logged a mood entry in the last 7 days
+  const hasRecentMoodCheckin = useMemo(() => {
+    if (!moodEntries?.length) return false;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 7);
+    const cutoffISO = cutoff.toISOString().slice(0, 10);
+    return moodEntries.some(e => (e.date || '') >= cutoffISO);
+  }, [moodEntries]);
 
   function dismiss(key) {
     setDismissedPrompts(prev => [...prev, key]);
@@ -362,7 +372,7 @@ export default function DashboardTab() {
               onDismiss={() => dismiss('weight')}
             />
           )}
-          {!dismissedPrompts.includes('mood') && (
+          {!dismissedPrompts.includes('mood') && !hasRecentMoodCheckin && (
             <ActionPrompt
               icon={"😊"}
               title="How are you feeling?"
