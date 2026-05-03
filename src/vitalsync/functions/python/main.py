@@ -256,6 +256,75 @@ def _map_intervals_activity(act: dict) -> dict:
 # SYNC CORE
 # ══════════════════════════════════════════════════════
 
+def _refresh_athlete_profile(uid: str, api_key: str) -> dict:
+    """Pull FTP / threshold HR / max HR / threshold pace from intervals.icu and persist
+    them onto users/{uid}.profile so the rest of the app (Dashboard, AI Context, plan
+    generation) can read them. Returns the update dict applied (empty if nothing).
+    """
+    try:
+        result = _intervals_request(api_key, '/athlete/0/profile', default={}) or {}
+    except IntervalsAuthError:
+        raise
+    except Exception as e:
+        print(f'Failed to fetch intervals athlete profile: {e}')
+        return {}
+
+    # Response shape varies — try both flat and nested {athlete: {...}} forms
+    athlete = result.get('athlete') if isinstance(result.get('athlete'), dict) else result
+    if not isinstance(athlete, dict):
+        return {}
+
+    update = {}
+
+    def _pick(*keys):
+        for k in keys:
+            v = athlete.get(k)
+            if v is not None and v != 0 and v != '':
+                return v
+        return None
+
+    ftp = _pick('icu_ftp', 'ftp', 'ftpw')
+    if ftp and ftp > 0:
+        update['ftp'] = int(ftp)
+        update['ftpSource'] = 'intervals'
+
+    lthr = _pick('lthr', 'icu_lthr', 'thresholdHr', 'threshold_hr')
+    if lthr and lthr > 0:
+        update['thresholdHR'] = int(lthr)
+
+    max_hr = _pick('max_heartrate', 'icu_max_heartrate', 'maxHr')
+    if max_hr and max_hr > 0:
+        update['maxHR'] = int(max_hr)
+
+    resting_hr = _pick('icu_resting_hr', 'restingHr')
+    if resting_hr and resting_hr > 0:
+        update['restingHR'] = int(resting_hr)
+
+    threshold_pace = _pick('threshold_pace', 'icu_threshold_pace')
+    if threshold_pace and threshold_pace > 0:
+        update['thresholdPace'] = threshold_pace
+
+    weight = _pick('weight', 'icu_weight')
+    if weight and weight > 0 and not update.get('weight'):
+        # Only set weight if intervals.icu has it AND the existing weight came from intervals/empty
+        # (don't clobber a recent manual entry)
+        user_doc = db.document(f'users/{uid}').get().to_dict() or {}
+        existing = (user_doc.get('profile') or {}).get('weight')
+        existing_source = (user_doc.get('profile') or {}).get('weightSource')
+        if not existing or existing_source == 'intervals':
+            update['weight'] = round(float(weight), 1)
+            update['weightSource'] = 'intervals'
+
+    if update:
+        try:
+            db.document(f'users/{uid}').set({'profile': update}, merge=True)
+            print(f'Refreshed profile from intervals.icu: {update}')
+        except Exception as e:
+            print(f'Profile update write failed: {e}')
+
+    return update
+
+
 def _resume_start_date(uid: str) -> str:
     """Resume from latest garmin/intervals sync timestamp (with 1d overlap), else 30d ago."""
     user = db.document(f'users/{uid}').get().to_dict() or {}
@@ -364,6 +433,14 @@ def _do_intervals_sync(uid: str, api_key: str, start_date: str, end_date: str = 
         _sync_plan_completion(uid, activities)
     except Exception as e:
         print(f'Plan completion sync failed for {uid}: {e}')
+
+    # Refresh FTP / threshold HR / weight from intervals.icu athlete profile
+    try:
+        _refresh_athlete_profile(uid, api_key)
+    except IntervalsAuthError:
+        raise
+    except Exception as e:
+        print(f'Athlete profile refresh failed for {uid}: {e}')
 
     print(f'intervals sync done {uid}: {len(wellness)} wellness, {len(activities)} activities')
     return {'wellness': len(wellness), 'activities': len(activities)}
