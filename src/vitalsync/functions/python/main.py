@@ -240,19 +240,19 @@ def _map_intervals_activity(act: dict) -> dict:
 # ══════════════════════════════════════════════════════
 
 def _resume_start_date(uid: str) -> str:
-    """Most recent date across wellnessDaily + garminDailies, else 30d ago."""
+    """Resume from latest garmin/intervals sync timestamp (with 1d overlap), else 30d ago."""
+    user = db.document(f'users/{uid}').get().to_dict() or {}
     candidates = []
-    for coll in ('wellnessDaily', 'garminDailies'):
-        docs = list(
-            db.collection(f'users/{uid}/{coll}')
-            .order_by('__name__', direction='DESCENDING')
-            .limit(1)
-            .stream()
-        )
-        if docs:
-            candidates.append(docs[0].id)
+    for cfg_key in ('intervals', 'garmin'):
+        cfg = user.get(cfg_key, {}) or {}
+        ts = cfg.get('last_sync_at')
+        if ts is not None and hasattr(ts, 'date'):
+            try:
+                candidates.append(ts.date())
+            except Exception:
+                pass
     if candidates:
-        return max(candidates)
+        return (max(candidates) - timedelta(days=1)).isoformat()
     return (date.today() - timedelta(days=30)).isoformat()
 
 
@@ -341,6 +341,12 @@ def _do_intervals_sync(uid: str, api_key: str, start_date: str, end_date: str = 
 
     if write_count > 0:
         batch.commit()
+
+    # Mark plan sessions complete when activities pair with our pushed events
+    try:
+        _sync_plan_completion(uid, activities)
+    except Exception as e:
+        print(f'Plan completion sync failed for {uid}: {e}')
 
     print(f'intervals sync done {uid}: {len(wellness)} wellness, {len(activities)} activities')
     return {'wellness': len(wellness), 'activities': len(activities)}
@@ -613,6 +619,281 @@ def intervals_backfill(req: https_fn.CallableRequest) -> dict:
 
 
 # ══════════════════════════════════════════════════════
+# TRAINING PLAN → INTERVALS.ICU PUSH
+# ══════════════════════════════════════════════════════
+
+# Slot defaults — morning is 05:30 per user request
+_SLOT_TIMES = {
+    'morning': '05:30',
+    'afternoon': '12:00',
+    'evening': '18:00',
+}
+
+_DAY_OFFSET = {
+    'monday': 0, 'mon': 0,
+    'tuesday': 1, 'tue': 1,
+    'wednesday': 2, 'wed': 2,
+    'thursday': 3, 'thu': 3,
+    'friday': 4, 'fri': 4,
+    'saturday': 5, 'sat': 5,
+    'sunday': 6, 'sun': 6,
+}
+
+_SESSION_TYPE_TO_INTERVALS = {
+    'run': 'Run',
+    'running': 'Run',
+    'cycle': 'Ride',
+    'cycling': 'Ride',
+    'bike': 'Ride',
+    'ride': 'Ride',
+    'swim': 'Swim',
+    'swimming': 'Swim',
+    'strength': 'WeightTraining',
+    'gym': 'WeightTraining',
+    'yoga': 'Yoga',
+    'active_recovery': 'Workout',
+    'walk': 'Walk',
+    'walking': 'Walk',
+    'hike': 'Hike',
+    'hiking': 'Hike',
+    'rowing': 'Rowing',
+    'kayak': 'Kayaking',
+}
+
+
+def _session_datetime(week_start: str, day: str, slot: str) -> str:
+    """Return ISO datetime in intervals.icu's expected format (no timezone suffix)."""
+    week_start_date = date.fromisoformat(week_start)
+    offset = _DAY_OFFSET.get((day or '').lower(), 0)
+    session_date = week_start_date + timedelta(days=offset)
+    time_str = _SLOT_TIMES.get((slot or 'morning').lower(), '07:00')
+    return f'{session_date.isoformat()}T{time_str}:00'
+
+
+def _build_event_payload(plan_id: str, session: dict, week_start: str) -> dict | None:
+    """Map a plan session → intervals.icu event payload. Returns None to skip (rest)."""
+    sess_type = (session.get('type') or '').lower()
+    if sess_type in ('rest', ''):
+        return None
+    intervals_type = _SESSION_TYPE_TO_INTERVALS.get(sess_type, 'Workout')
+
+    day = session.get('day') or 'monday'
+    slot = session.get('slot') or 'morning'
+    start = _session_datetime(week_start, day, slot)
+
+    duration_min = session.get('durationMinutes') or 0
+    moving_time = int(duration_min * 60) if duration_min else None
+
+    description_parts = []
+    if session.get('description'):
+        description_parts.append(session['description'])
+    if session.get('warmUp'):
+        description_parts.append(f"Warm-up: {session['warmUp']}")
+    if session.get('mainSet'):
+        description_parts.append(f"Main: {session['mainSet']}")
+    if session.get('coolDown'):
+        description_parts.append(f"Cool-down: {session['coolDown']}")
+    workout_script = (session.get('workoutScript') or '').strip()
+    if workout_script:
+        description_parts.append('\n' + workout_script)
+    description = '\n\n'.join(description_parts)
+
+    payload = {
+        'category': 'WORKOUT',
+        'type': intervals_type,
+        'start_date_local': start,
+        'name': session.get('title') or 'Training session',
+        'description': description,
+        'external_id': f'vitalsync-{plan_id}-{day.lower()}-{slot.lower()}',
+    }
+    if moving_time:
+        payload['moving_time'] = moving_time
+    return payload
+
+
+def _intervals_post(api_key: str, path: str, json_body: dict):
+    """POST helper for intervals.icu (returns parsed JSON or raises IntervalsAuthError)."""
+    url = f"{INTERVALS_BASE_URL}{path}"
+    resp = requests.post(
+        url,
+        auth=('API_KEY', api_key),
+        json=json_body,
+        timeout=30,
+        headers={'Accept': 'application/json'},
+    )
+    if resp.status_code == 401:
+        raise IntervalsAuthError('Invalid API key')
+    resp.raise_for_status()
+    return resp.json() if resp.content else {}
+
+
+def _intervals_delete(api_key: str, path: str):
+    """DELETE helper for intervals.icu (swallows 404 — already gone)."""
+    url = f"{INTERVALS_BASE_URL}{path}"
+    resp = requests.delete(
+        url,
+        auth=('API_KEY', api_key),
+        timeout=30,
+        headers={'Accept': 'application/json'},
+    )
+    if resp.status_code == 401:
+        raise IntervalsAuthError('Invalid API key')
+    if resp.status_code in (404, 410):
+        return None
+    resp.raise_for_status()
+    return None
+
+
+def _delete_intervals_events(api_key: str, event_ids: list):
+    for eid in event_ids:
+        if not eid:
+            continue
+        try:
+            _intervals_delete(api_key, f'/athlete/0/events/{eid}')
+        except IntervalsAuthError:
+            raise
+        except Exception as e:
+            print(f'Failed to delete intervals event {eid}: {e}')
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=300,
+    secrets=[ENCRYPTION_KEY_SECRET],
+)
+def intervals_push_plan(req: https_fn.CallableRequest) -> dict:
+    """Push a training plan's sessions to intervals.icu as scheduled events.
+    Idempotent: deletes any previously pushed events for this plan first.
+    """
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    plan_id = req.data.get('planId')
+    if not plan_id:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='planId is required',
+        )
+
+    plan_ref = db.document(f'users/{uid}/trainingPlans/{plan_id}')
+    plan_snap = plan_ref.get()
+    if not plan_snap.exists:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.NOT_FOUND,
+            message='Plan not found',
+        )
+
+    plan = plan_snap.to_dict()
+    week_start = plan.get('weekStartDate')
+    sessions = plan.get('sessions') or []
+    if not week_start or not sessions:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            message='Plan is missing weekStartDate or sessions',
+        )
+
+    api_key = _get_user_api_key(uid)
+
+    # Delete any previously pushed events for this plan (idempotent re-push).
+    prior_event_ids = plan.get('intervalsEventIds') or []
+    if prior_event_ids:
+        try:
+            _delete_intervals_events(api_key, prior_event_ids)
+        except IntervalsAuthError:
+            db.document(f'users/{uid}').set({
+                'intervals': {'needs_reauth': True},
+            }, merge=True)
+            raise https_fn.HttpsError(
+                code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+                message='intervals.icu rejected the API key.',
+            )
+
+    # Push new events; preserve session-index alignment so completion sync can match.
+    event_ids = []
+    pushed = 0
+    skipped = 0
+    failures = []
+    for idx, session in enumerate(sessions):
+        payload = _build_event_payload(plan_id, session, week_start)
+        if payload is None:
+            event_ids.append(None)
+            skipped += 1
+            continue
+        try:
+            result = _intervals_post(api_key, '/athlete/0/events', payload)
+            eid = result.get('id') if isinstance(result, dict) else None
+            event_ids.append(eid)
+            if eid:
+                pushed += 1
+            else:
+                failures.append(f'session {idx}: no id returned')
+        except IntervalsAuthError:
+            db.document(f'users/{uid}').set({
+                'intervals': {'needs_reauth': True},
+            }, merge=True)
+            raise https_fn.HttpsError(
+                code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+                message='intervals.icu rejected the API key.',
+            )
+        except Exception as e:
+            print(f'Failed to push session {idx}: {e}')
+            event_ids.append(None)
+            failures.append(f'session {idx}: {e}')
+
+    plan_ref.set({
+        'intervalsEventIds': event_ids,
+        'pushedToIntervalsAt': firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+
+    return {
+        'status': 'ok',
+        'pushed': pushed,
+        'skipped': skipped,
+        'failed': len(failures),
+        'failures': failures[:5],
+    }
+
+
+def _sync_plan_completion(uid: str, activities: list):
+    """Mark plan sessions completed when an intervals.icu activity links to a pushed event.
+    Activities must be raw intervals.icu objects (with paired_event_id field).
+    """
+    if not activities:
+        return
+    paired_event_ids = {a.get('paired_event_id') for a in activities if a.get('paired_event_id')}
+    if not paired_event_ids:
+        return
+
+    # Active plans only — recent ones might still have un-completed sessions.
+    plans_q = (
+        db.collection(f'users/{uid}/trainingPlans')
+        .order_by('createdAt', direction='DESCENDING')
+        .limit(4)
+    )
+    for plan_snap in plans_q.stream():
+        plan = plan_snap.to_dict()
+        event_ids = plan.get('intervalsEventIds') or []
+        if not event_ids:
+            continue
+        sessions = plan.get('sessions') or []
+        changed = False
+        for idx, eid in enumerate(event_ids):
+            if eid and eid in paired_event_ids and idx < len(sessions):
+                if not sessions[idx].get('completed'):
+                    sessions[idx]['completed'] = True
+                    sessions[idx]['completedSource'] = 'intervals'
+                    changed = True
+        if changed:
+            plan_snap.reference.set({'sessions': sessions}, merge=True)
+            print(f'Plan {plan_snap.id}: marked sessions complete from intervals.icu')
+
+
+# ══════════════════════════════════════════════════════
 # USER DATA DELETION (GDPR)
 # ══════════════════════════════════════════════════════
 
@@ -712,6 +993,35 @@ PRINCIPLES:
 - Include warm-up and cool-down in every session
 - For runners: 80/20 rule (80% easy, 20% hard effort)
 
+For each non-rest session, also output `workoutScript` — a structured workout in
+intervals.icu's workout-builder syntax. This pushes a paired workout to the user's
+Garmin/Hammerhead via intervals.icu so they can follow it on the device. Format:
+
+  - Warmup
+  10m 60% HR
+
+  - Main set
+  4x
+  3m 105% Threshold
+  2m 50% Recovery
+
+  - Cooldown
+  5m 50%
+
+Rules for workoutScript:
+- Each step: "<duration><unit> <target><unit> <optional label>"
+- Duration units: m (minutes), s (seconds)
+- Target by sport:
+    Cycling/Ride: % (%FTP power), W (watts), or bpm (HR)
+    Run: bpm (HR), %hr (% max HR), or pace like 5:00/km
+    Swim: pace like 1:30/100m
+- Use "Nx" prefix on its own line to start a repeat block; indent the repeated steps
+- Labels (after the target) are optional but useful (e.g. "Threshold", "Recovery")
+- Section headers like "- Warmup", "- Main set", "- Cooldown" are recommended
+- Total duration of all steps MUST equal durationMinutes
+- For strength, yoga, or active_recovery: set workoutScript to "" (empty) — these
+  don't structure into intervals on the device
+
 OUTPUT FORMAT (JSON only, no markdown fences):
 {
   "weekSummary": "Overview and focus for this week",
@@ -720,7 +1030,7 @@ OUTPUT FORMAT (JSON only, no markdown fences):
   "sessions": [
     {
       "day": "monday",
-      "slot": "morning",
+      "slot": "morning|afternoon|evening",
       "type": "run|cycle|swim|strength|yoga|rest|active_recovery",
       "title": "Short title",
       "description": "What to do",
@@ -728,7 +1038,8 @@ OUTPUT FORMAT (JSON only, no markdown fences):
       "intensityLevel": "easy|moderate|hard|max",
       "warmUp": "5 min walk, dynamic stretches",
       "mainSet": "Description of main workout",
-      "coolDown": "5 min walk, static stretches"
+      "coolDown": "5 min walk, static stretches",
+      "workoutScript": "- Warmup\\n10m 60%\\n\\n- Main\\n4x\\n3m 105%\\n2m 50%\\n\\n- Cooldown\\n5m 50%"
     }
   ]
 }"""

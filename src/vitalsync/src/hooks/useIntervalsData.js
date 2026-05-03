@@ -176,6 +176,12 @@ export function useIntervalsSync() {
     return fn({ days });
   }
 
+  async function pushPlan(planId) {
+    if (!user || !connected) throw new Error('Connect intervals.icu first');
+    const fn = httpsCallable(functions, 'intervals_push_plan');
+    return fn({ planId });
+  }
+
   async function computeStats() {
     if (!user) return null;
     const fn = httpsCallable(functions, 'compute_stats_on_demand');
@@ -194,6 +200,7 @@ export function useIntervalsSync() {
     connectIntervals,
     disconnectIntervals,
     backfillHistory,
+    pushPlan,
     computeStats,
   };
 }

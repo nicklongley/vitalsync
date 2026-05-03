@@ -8,14 +8,18 @@ import { collection, query, orderBy, limit, onSnapshot, doc, updateDoc } from 'f
 import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useIntervalsSync } from '@/hooks/useIntervalsData';
 
 const DAY_LABELS = { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday' };
 
 export default function TrainingTab() {
   const { user } = useAuth();
+  const { connected: intervalsConnected, pushPlan } = useIntervalsSync();
   const [plans, setPlans] = useState([]);
   const [loadingPlans, setLoadingPlans] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [pushing, setPushing] = useState(false);
+  const [pushResult, setPushResult] = useState('');
   const [error, setError] = useState('');
 
   // Listen to training plans
@@ -50,6 +54,27 @@ export default function TrainingTab() {
       setError(err.message || 'Failed to generate plan.');
     } finally {
       setGenerating(false);
+    }
+  }
+
+  async function handlePushPlan(planId) {
+    if (pushing) return;
+    setPushing(true);
+    setError('');
+    setPushResult('');
+    try {
+      const result = await pushPlan(planId);
+      const data = result?.data || {};
+      const parts = [`${data.pushed || 0} pushed`];
+      if (data.skipped) parts.push(`${data.skipped} skipped (rest)`);
+      if (data.failed) parts.push(`${data.failed} failed`);
+      setPushResult(parts.join(' · '));
+      setTimeout(() => setPushResult(''), 6000);
+    } catch (err) {
+      console.error('Push plan failed:', err);
+      setError(err.message || 'Failed to push plan to intervals.icu.');
+    } finally {
+      setPushing(false);
     }
   }
 
@@ -125,6 +150,30 @@ export default function TrainingTab() {
                 ))}
               </div>
             )}
+
+            {/* intervals.icu push */}
+            <div className="mt-3 pt-3 border-t border-slate-700/50 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                {currentPlan.pushedToIntervalsAt ? (
+                  <p className="text-[10px] text-emerald-400">
+                    {"✓"} Synced to intervals.icu · {(currentPlan.intervalsEventIds || []).filter(Boolean).length} sessions
+                  </p>
+                ) : (
+                  <p className="text-[10px] text-slate-500">Push sessions to your Garmin/Hammerhead via intervals.icu</p>
+                )}
+                {pushResult && <p className="text-[10px] text-cyan-400 mt-0.5">{pushResult}</p>}
+              </div>
+              <button
+                onClick={() => handlePushPlan(currentPlan.id)}
+                disabled={pushing || !intervalsConnected}
+                title={!intervalsConnected ? 'Connect intervals.icu in Settings first' : ''}
+                className="px-3 py-2 rounded-lg text-[11px] font-medium bg-cyan-600/20 border border-cyan-700/50
+                           text-cyan-400 hover:bg-cyan-600/30 disabled:opacity-40 disabled:cursor-not-allowed
+                           transition-colors min-h-[36px] whitespace-nowrap"
+              >
+                {pushing ? 'Pushing...' : currentPlan.pushedToIntervalsAt ? 'Re-push' : 'Push to intervals.icu'}
+              </button>
+            </div>
           </div>
 
           {/* Sessions */}
