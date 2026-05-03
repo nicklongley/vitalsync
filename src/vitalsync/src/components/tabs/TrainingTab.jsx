@@ -170,36 +170,47 @@ export default function TrainingTab() {
         <div className="flex justify-center py-8">
           <div className="w-8 h-8 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin" />
         </div>
-      ) : currentPlan ? (
+      ) : viewedPlan ? (
         <>
-          {/* Current plan header */}
+          {isViewingPast && (
+            <button
+              onClick={() => setSelectedPlanId(null)}
+              className="flex items-center gap-1 text-xs text-slate-400 hover:text-emerald-400 transition-colors min-h-[36px] -ml-1 px-1"
+            >
+              <span>{'‹'}</span> Back to this week
+            </button>
+          )}
+
+          {/* Plan header */}
           <div className="glass-card p-4">
             <div className="flex items-start justify-between mb-2 gap-3">
               <div className="min-w-0">
-                <p className="text-sm font-semibold text-white">This Week's Plan</p>
+                <p className="text-sm font-semibold text-white">{isViewingPast ? 'Previous Plan' : "This Week's Plan"}</p>
                 <p className="text-[10px] text-slate-500">
-                  {currentPlan.weekStartDate} to {currentPlan.weekEndDate}
+                  {viewedPlan.weekStartDate} to {viewedPlan.weekEndDate}
                 </p>
-                <button
-                  onClick={() => { setAdjustResult(''); setAdjustModalOpen(true); }}
-                  className="text-[11px] text-cyan-400 hover:text-cyan-300 mt-1 transition-colors"
-                >
-                  ✎ Adjust plan
-                </button>
+                {!isViewingPast && (
+                  <button
+                    onClick={() => { setAdjustResult(''); setAdjustModalOpen(true); }}
+                    className="text-[11px] text-cyan-400 hover:text-cyan-300 mt-1 transition-colors"
+                  >
+                    ✎ Adjust plan
+                  </button>
+                )}
               </div>
               <div className="text-right">
                 <p className="text-xs text-slate-400">Planned</p>
                 <p className="text-lg font-mono font-bold text-emerald-400">
-                  {currentPlan.totalPlannedMinutes ? `${Math.round(currentPlan.totalPlannedMinutes / 60)}h` : '--'}
+                  {viewedPlan.totalPlannedMinutes ? `${Math.round(viewedPlan.totalPlannedMinutes / 60)}h` : '--'}
                 </p>
               </div>
             </div>
-            {currentPlan.summary && (
-              <p className="text-xs text-slate-300 leading-relaxed">{currentPlan.summary}</p>
+            {viewedPlan.summary && (
+              <p className="text-xs text-slate-300 leading-relaxed">{viewedPlan.summary}</p>
             )}
-            {currentPlan.focusAreas?.length > 0 && (
+            {viewedPlan.focusAreas?.length > 0 && (
               <div className="flex flex-wrap gap-1.5 mt-2">
-                {currentPlan.focusAreas.map((area, i) => (
+                {viewedPlan.focusAreas.map((area, i) => (
                   <span key={i} className="px-2 py-0.5 rounded-full text-[10px] bg-cyan-900/30 text-cyan-400 border border-cyan-800/40">
                     {area}
                   </span>
@@ -207,43 +218,46 @@ export default function TrainingTab() {
               </div>
             )}
 
-            {/* intervals.icu push */}
-            <div className="mt-3 pt-3 border-t border-slate-700/50 flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                {currentPlan.pushedToIntervalsAt ? (
-                  <p className="text-[10px] text-emerald-400">
-                    {"✓"} Synced to intervals.icu · {(currentPlan.intervalsEventIds || []).filter(Boolean).length} sessions
-                  </p>
-                ) : (
-                  <p className="text-[10px] text-slate-500">Push sessions to your Garmin/Hammerhead via intervals.icu</p>
-                )}
-                {pushResult && <p className="text-[10px] text-cyan-400 mt-0.5">{pushResult}</p>}
+            {/* intervals.icu push (current plan only) */}
+            {!isViewingPast && (
+              <div className="mt-3 pt-3 border-t border-slate-700/50 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  {viewedPlan.pushedToIntervalsAt ? (
+                    <p className="text-[10px] text-emerald-400">
+                      {"✓"} Synced to intervals.icu · {(viewedPlan.intervalsEventIds || []).filter(Boolean).length} sessions
+                    </p>
+                  ) : (
+                    <p className="text-[10px] text-slate-500">Push sessions to your Garmin/Hammerhead via intervals.icu</p>
+                  )}
+                  {pushResult && <p className="text-[10px] text-cyan-400 mt-0.5">{pushResult}</p>}
+                </div>
+                <button
+                  onClick={() => handlePushPlan(viewedPlan.id)}
+                  disabled={pushing || !intervalsConnected}
+                  title={!intervalsConnected ? 'Connect intervals.icu in Settings first' : ''}
+                  className="px-3 py-2 rounded-lg text-[11px] font-medium bg-cyan-600/20 border border-cyan-700/50
+                             text-cyan-400 hover:bg-cyan-600/30 disabled:opacity-40 disabled:cursor-not-allowed
+                             transition-colors min-h-[36px] whitespace-nowrap"
+                >
+                  {pushing ? 'Pushing...' : viewedPlan.pushedToIntervalsAt ? 'Re-push' : 'Push to intervals.icu'}
+                </button>
               </div>
-              <button
-                onClick={() => handlePushPlan(currentPlan.id)}
-                disabled={pushing || !intervalsConnected}
-                title={!intervalsConnected ? 'Connect intervals.icu in Settings first' : ''}
-                className="px-3 py-2 rounded-lg text-[11px] font-medium bg-cyan-600/20 border border-cyan-700/50
-                           text-cyan-400 hover:bg-cyan-600/30 disabled:opacity-40 disabled:cursor-not-allowed
-                           transition-colors min-h-[36px] whitespace-nowrap"
-              >
-                {pushing ? 'Pushing...' : currentPlan.pushedToIntervalsAt ? 'Re-push' : 'Push to intervals.icu'}
-              </button>
-            </div>
+            )}
           </div>
 
           {/* Sessions */}
           <div className="space-y-2">
-            {(currentPlan.sessions || []).map((session, i) => (
+            {(viewedPlan.sessions || []).map((session, i) => (
               <div key={i} className={`glass-card p-4 transition-all ${session.completed ? 'opacity-60' : ''}`}>
                 <div className="flex items-start gap-3">
                   <button
-                    onClick={() => toggleSession(currentPlan.id, i, !session.completed)}
+                    onClick={() => !isViewingPast && toggleSession(viewedPlan.id, i, !session.completed)}
+                    disabled={isViewingPast}
                     className={`w-6 h-6 rounded-lg border-2 flex-shrink-0 flex items-center justify-center mt-0.5 transition-colors ${
                       session.completed
                         ? 'bg-emerald-600 border-emerald-600 text-white'
                         : 'border-slate-600 hover:border-emerald-600'
-                    }`}
+                    } ${isViewingPast ? 'cursor-default opacity-70' : ''}`}
                   >
                     {session.completed && '\u2713'}
                   </button>
@@ -270,18 +284,18 @@ export default function TrainingTab() {
           </div>
 
           {/* Progress */}
-          {currentPlan.sessions?.length > 0 && (
+          {viewedPlan.sessions?.length > 0 && (
             <div className="glass-card p-4">
               <div className="flex items-center justify-between mb-2">
-                <p className="text-xs text-slate-400">Week Progress</p>
+                <p className="text-xs text-slate-400">{isViewingPast ? 'Completion' : 'Week Progress'}</p>
                 <p className="text-xs font-mono text-white">
-                  {currentPlan.sessions.filter(s => s.completed).length}/{currentPlan.sessions.length} sessions
+                  {viewedPlan.sessions.filter(s => s.completed).length}/{viewedPlan.sessions.length} sessions
                 </p>
               </div>
               <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-gradient-to-r from-emerald-500 to-cyan-400 rounded-full transition-all duration-500"
-                  style={{ width: `${(currentPlan.sessions.filter(s => s.completed).length / currentPlan.sessions.length) * 100}%` }}
+                  style={{ width: `${(viewedPlan.sessions.filter(s => s.completed).length / viewedPlan.sessions.length) * 100}%` }}
                 />
               </div>
             </div>
