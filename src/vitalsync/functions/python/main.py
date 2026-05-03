@@ -753,12 +753,15 @@ _SESSION_TYPE_TO_INTERVALS = {
 
 
 def _session_datetime(week_start: str, day: str, slot: str) -> str:
-    """Return ISO datetime in intervals.icu's expected format (no timezone suffix)."""
+    """Return start_date_local for an intervals.icu WORKOUT event.
+    intervals.icu requires WORKOUT events to use T00:00:00 (date-only, all-day);
+    a real time component causes the event to land on the wrong day or get
+    rejected. Slot is recorded on our own plan doc but not on the intervals event.
+    """
     week_start_date = date.fromisoformat(week_start)
     offset = _DAY_OFFSET.get((day or '').lower(), 0)
     session_date = week_start_date + timedelta(days=offset)
-    time_str = _SLOT_TIMES.get((slot or 'morning').lower(), '07:00')
-    return f'{session_date.isoformat()}T{time_str}:00'
+    return f'{session_date.isoformat()}T00:00:00'
 
 
 def _build_event_payload(plan_id: str, session: dict, week_start: str) -> dict | None:
@@ -775,19 +778,24 @@ def _build_event_payload(plan_id: str, session: dict, week_start: str) -> dict |
     duration_min = session.get('durationMinutes') or 0
     moving_time = int(duration_min * 60) if duration_min else None
 
-    description_parts = []
-    if session.get('description'):
-        description_parts.append(session['description'])
-    if session.get('warmUp'):
-        description_parts.append(f"Warm-up: {session['warmUp']}")
-    if session.get('mainSet'):
-        description_parts.append(f"Main: {session['mainSet']}")
-    if session.get('coolDown'):
-        description_parts.append(f"Cool-down: {session['coolDown']}")
+    # intervals.icu parses the description as workout-builder syntax to build
+    # structured intervals. Free-text mixed in confuses the parser, so prefer
+    # the structured workoutScript when available; only fall back to plain
+    # text if no script (e.g. strength/yoga sessions).
     workout_script = (session.get('workoutScript') or '').strip()
     if workout_script:
-        description_parts.append('\n' + workout_script)
-    description = '\n\n'.join(description_parts)
+        description = workout_script
+    else:
+        parts = []
+        if session.get('description'):
+            parts.append(session['description'])
+        if session.get('warmUp'):
+            parts.append(f"Warm-up: {session['warmUp']}")
+        if session.get('mainSet'):
+            parts.append(f"Main: {session['mainSet']}")
+        if session.get('coolDown'):
+            parts.append(f"Cool-down: {session['coolDown']}")
+        description = '\n\n'.join(parts)
 
     payload = {
         'category': 'WORKOUT',
@@ -1085,33 +1093,44 @@ PRINCIPLES:
 - For runners: 80/20 rule (80% easy, 20% hard effort)
 
 For each non-rest session, also output `workoutScript` — a structured workout in
-intervals.icu's workout-builder syntax. This pushes a paired workout to the user's
-Garmin/Hammerhead via intervals.icu so they can follow it on the device. Format:
+intervals.icu's workout-builder syntax. intervals.icu parses this and pushes a paired
+structured workout to the user's Garmin/Hammerhead. Get the syntax exactly right.
 
-  - Warmup
-  10m 60% HR
+CYCLING (type=cycle/Ride) example:
+  Warmup
+  - 10m 60%
+  - 5m ramp 60%-80%
 
-  - Main set
   4x
-  3m 105% Threshold
-  2m 50% Recovery
+  - 3m 105%
+  - 2m 50%
 
-  - Cooldown
-  5m 50%
+  Cooldown
+  - 10m 50%
 
-Rules for workoutScript:
-- Each step: "<duration><unit> <target><unit> <optional label>"
-- Duration units: m (minutes), s (seconds)
+RUNNING (type=run/Run) example:
+  Warmup
+  - 10m 65-70% HR
+
+  Main
+  - 30m 78-82% Pace
+
+  Cooldown
+  - 10m 65% HR
+
+SYNTAX RULES (strict — the parser is fussy):
+- Section headers ("Warmup", "Main", "Cooldown") are on their OWN line with NO leading dash
+- Each step line starts with "- " (dash then space) at column 0
+- Step format: "- <duration> <target> [optional cadence/note]"
+- Duration units: 30s, 5m, 1h30m (combine units, no spaces)
+- Repeat blocks: put "Nx" on its OWN line, then the steps below (no indentation needed)
 - Target by sport:
-    Cycling/Ride: % (%FTP power), W (watts), or bpm (HR)
-    Run: bpm (HR), %hr (% max HR), or pace like 5:00/km
-    Swim: pace like 1:30/100m
-- Use "Nx" prefix on its own line to start a repeat block; indent the repeated steps
-- Labels (after the target) are optional but useful (e.g. "Threshold", "Recovery")
-- Section headers like "- Warmup", "- Main set", "- Cooldown" are recommended
-- Total duration of all steps MUST equal durationMinutes
-- For strength, yoga, or active_recovery: set workoutScript to "" (empty) — these
-  don't structure into intervals on the device
+    Cycling: bare "%" means %FTP (e.g. "90%"), or "220w" watts, or "Z2"/"Z3-Z4" zones
+    Running: explicit "% HR" / "% LTHR" / "% Pace" (NOT %FTP — that's cycling-only)
+    Swimming: explicit "% Pace" or pace like "1:30/100m Pace"
+- Use ranges (88-92%) instead of exact targets for outdoor sessions
+- Total of all step durations MUST equal durationMinutes
+- For strength, yoga, or active_recovery: set workoutScript to "" (empty)
 
 OUTPUT FORMAT (JSON only, no markdown fences):
 {
@@ -1130,7 +1149,7 @@ OUTPUT FORMAT (JSON only, no markdown fences):
       "warmUp": "5 min walk, dynamic stretches",
       "mainSet": "Description of main workout",
       "coolDown": "5 min walk, static stretches",
-      "workoutScript": "- Warmup\\n10m 60%\\n\\n- Main\\n4x\\n3m 105%\\n2m 50%\\n\\n- Cooldown\\n5m 50%"
+      "workoutScript": "Warmup\\n- 10m 60%\\n\\n4x\\n- 3m 105%\\n- 2m 50%\\n\\nCooldown\\n- 10m 50%"
     }
   ]
 }"""
