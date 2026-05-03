@@ -10,6 +10,7 @@ import { db, functions } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
 import { useIntervalsSync } from '@/hooks/useIntervalsData';
 import WeeklyPlanContextModal from '@/components/WeeklyPlanContextModal';
+import WeeklyPlanAdjustModal from '@/components/WeeklyPlanAdjustModal';
 
 const DAY_LABELS = { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday' };
 
@@ -23,6 +24,9 @@ export default function TrainingTab() {
   const [pushResult, setPushResult] = useState('');
   const [error, setError] = useState('');
   const [contextModalOpen, setContextModalOpen] = useState(false);
+  const [adjustModalOpen, setAdjustModalOpen] = useState(false);
+  const [adjusting, setAdjusting] = useState(false);
+  const [adjustResult, setAdjustResult] = useState('');
 
   // Listen to training plans
   useEffect(() => {
@@ -62,6 +66,27 @@ export default function TrainingTab() {
       setError(err.message || 'Failed to generate plan.');
     } finally {
       setGenerating(false);
+    }
+  }
+
+  async function handleAdjustPlan(instruction) {
+    if (!currentPlan?.id) return;
+    setAdjusting(true);
+    setAdjustResult('');
+    setError('');
+    try {
+      const fn = httpsCallable(functions, 'ai_modify_plan');
+      const res = await fn({ planId: currentPlan.id, instruction });
+      const data = res?.data || {};
+      const summary = data.summary || 'Plan updated.';
+      const repushNote = data.rePushed ? ' intervals.icu calendar updated too.' : '';
+      setAdjustResult(`${summary}${repushNote}`);
+    } catch (err) {
+      console.error('Plan adjustment failed:', err);
+      setError(err.message || 'Failed to adjust plan.');
+      setAdjustModalOpen(false);
+    } finally {
+      setAdjusting(false);
     }
   }
 
@@ -112,6 +137,13 @@ export default function TrainingTab() {
         onSubmit={generatePlan}
         generating={generating}
       />
+      <WeeklyPlanAdjustModal
+        open={adjustModalOpen}
+        working={adjusting}
+        lastResult={adjustResult}
+        onCancel={() => { if (!adjusting) { setAdjustModalOpen(false); setAdjustResult(''); } }}
+        onSubmit={handleAdjustPlan}
+      />
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-bold text-white">Training Plan</h2>
         <button
@@ -139,12 +171,18 @@ export default function TrainingTab() {
         <>
           {/* Current plan header */}
           <div className="glass-card p-4">
-            <div className="flex items-center justify-between mb-2">
-              <div>
+            <div className="flex items-start justify-between mb-2 gap-3">
+              <div className="min-w-0">
                 <p className="text-sm font-semibold text-white">This Week's Plan</p>
                 <p className="text-[10px] text-slate-500">
                   {currentPlan.weekStartDate} to {currentPlan.weekEndDate}
                 </p>
+                <button
+                  onClick={() => { setAdjustResult(''); setAdjustModalOpen(true); }}
+                  className="text-[11px] text-cyan-400 hover:text-cyan-300 mt-1 transition-colors"
+                >
+                  ✎ Adjust plan
+                </button>
               </div>
               <div className="text-right">
                 <p className="text-xs text-slate-400">Planned</p>

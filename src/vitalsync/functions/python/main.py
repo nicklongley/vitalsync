@@ -1346,6 +1346,155 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
     }
 
 
+ADJUST_PLAN_INSTRUCTIONS = """
+
+YOU ARE MODIFYING AN EXISTING PLAN, NOT CREATING A NEW ONE.
+- Make the SMALLEST changes necessary to satisfy the user's adjustment request
+- Preserve unmodified sessions exactly as they are (same day, slot, type, title, durationMinutes, workoutScript, descriptions)
+- Output the FULL updated sessions array — do not return a diff
+- Total planned minutes should stay near the original unless the request implies otherwise
+- weekSummary should briefly describe what changed (1-2 sentences)
+"""
+
+
+# ══════════════════════════════════════════════════════
+# AI MODIFY PLAN
+# ══════════════════════════════════════════════════════
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=120,
+    secrets=[ANTHROPIC_KEY_SECRET, ENCRYPTION_KEY_SECRET],
+)
+def ai_modify_plan(req: https_fn.CallableRequest) -> dict:
+    """Adjust an existing plan with a small ad-hoc change.
+    If the plan was previously pushed to intervals.icu, the events are
+    automatically re-pushed so the user's calendar stays in sync.
+    """
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    plan_id = req.data.get('planId')
+    instruction = (req.data.get('instruction') or '').strip()
+    if not plan_id:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='planId is required',
+        )
+    if not instruction:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='Instruction is required',
+        )
+    instruction = instruction[:500]
+
+    plan_ref = db.document(f'users/{uid}/trainingPlans/{plan_id}')
+    plan_snap = plan_ref.get()
+    if not plan_snap.exists:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.NOT_FOUND,
+            message='Plan not found',
+        )
+    plan = plan_snap.to_dict()
+
+    payload = {
+        'currentPlan': {
+            'weekStartDate': plan.get('weekStartDate'),
+            'weekEndDate': plan.get('weekEndDate'),
+            'summary': plan.get('summary'),
+            'focusAreas': plan.get('focusAreas'),
+            'totalPlannedMinutes': plan.get('totalPlannedMinutes'),
+            'sessions': plan.get('sessions', []),
+        },
+        'adjustmentRequest': instruction,
+        'userProfile': _build_daily_context(uid).get('user', {}),
+    }
+
+    client = _get_anthropic_client()
+    response = client.messages.create(
+        model='claude-sonnet-4-5-20250929',
+        max_tokens=3000,
+        system=WEEKLY_PLAN_PROMPT + ADJUST_PLAN_INSTRUCTIONS,
+        messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
+    )
+    result = _parse_ai_json(response.content[0].text)
+
+    new_sessions = result.get('sessions') or []
+    if not new_sessions:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INTERNAL,
+            message='AI returned no sessions; please try again.',
+        )
+
+    # Preserve session completion state by matching day+slot
+    prior_sessions = plan.get('sessions') or []
+    prior_completed = {
+        ((s.get('day') or '').lower(), (s.get('slot') or '').lower()): s.get('completed', False)
+        for s in prior_sessions
+    }
+    for s in new_sessions:
+        key = ((s.get('day') or '').lower(), (s.get('slot') or '').lower())
+        if prior_completed.get(key):
+            s['completed'] = True
+        else:
+            s.setdefault('completed', False)
+
+    plan_ref.set({
+        'sessions': new_sessions,
+        'summary': result.get('weekSummary', plan.get('summary', '')),
+        'focusAreas': result.get('focusAreas', plan.get('focusAreas', [])),
+        'totalPlannedMinutes': result.get('totalPlannedMinutes', plan.get('totalPlannedMinutes', 0)),
+        'lastAdjustment': instruction,
+        'lastAdjustedAt': firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+
+    # If the plan was already pushed to intervals.icu, re-push so the calendar matches.
+    re_pushed = False
+    prior_event_ids = plan.get('intervalsEventIds') or []
+    if prior_event_ids:
+        try:
+            api_key = _get_user_api_key(uid)
+            _delete_intervals_events(api_key, prior_event_ids)
+            event_ids = []
+            for idx, session in enumerate(new_sessions):
+                ev_payload = _build_event_payload(plan_id, session, plan.get('weekStartDate'))
+                if ev_payload is None:
+                    event_ids.append(None)
+                    continue
+                try:
+                    res = _intervals_post(api_key, '/athlete/0/events', ev_payload)
+                    event_ids.append(res.get('id') if isinstance(res, dict) else None)
+                except Exception as e:
+                    print(f'Re-push session {idx} failed: {e}')
+                    event_ids.append(None)
+            plan_ref.set({
+                'intervalsEventIds': event_ids,
+                'pushedToIntervalsAt': firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+            re_pushed = True
+        except IntervalsAuthError:
+            db.document(f'users/{uid}').set({
+                'intervals': {'needs_reauth': True},
+            }, merge=True)
+        except https_fn.HttpsError:
+            # already-not-connected etc — silently skip re-push
+            pass
+        except Exception as e:
+            print(f'Plan re-push after adjustment failed for {uid}: {e}')
+
+    return {
+        'status': 'ok',
+        'sessionCount': len(new_sessions),
+        'summary': result.get('weekSummary', ''),
+        'rePushed': re_pushed,
+    }
+
+
 # ══════════════════════════════════════════════════════
 # AI ON-DEMAND QUERY
 # ══════════════════════════════════════════════════════
