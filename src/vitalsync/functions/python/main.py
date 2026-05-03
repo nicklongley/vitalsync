@@ -1621,6 +1621,279 @@ medical conditions. If asked about concerning symptoms, recommend consulting a d
 
 
 # ══════════════════════════════════════════════════════
+# AI CONTEXT — focus-file compilation
+# Generates personal markdown context files (training.focus.md, health.focus.md)
+# from captured user answers + intervals.icu data. Stored in Firestore at
+# users/{uid}/aiContext/{fileId}.
+# ══════════════════════════════════════════════════════
+
+TRAINING_FOCUS_PROMPT = """You compile a personal `training.focus.md` file capturing the
+athlete's CURRENT training state. Output GitHub-flavored markdown only — no code fences
+around the whole document, no preamble, no commentary. Follow the EXACT section structure.
+
+OUTPUT FORMAT:
+# Current Training Focus: {NAME}
+## Current fitness state
+## Current block intent
+## Recent sessions
+## Upcoming targets
+## This week's structure
+## Last updated: {DATE}
+
+PRINCIPLES:
+- The athlete may train across MULTIPLE sports — read their captured "sports" answer and
+  treat the file as plural-sport unless they stated otherwise. Do not default to cycling.
+- "Current fitness state" — short narrative on CTL (Fitness), ATL (Fatigue), Form (TSB),
+  FTP if known, weight; what those numbers mean RIGHT NOW (fresh / accumulating fatigue /
+  peak / detrained). 2-3 sentences max.
+- "Current block intent" — what kind of work the athlete is doing this block, inferred
+  from the recent session pattern PLUS their stated current target. 1-2 sentences.
+- "Recent sessions" — 3-6 bullet lines summarising the last week of activities. Include
+  sport, duration, character (easy / threshold / VO2 / long). Skip walks under 30min.
+- "Upcoming targets" — events / goals from captured `currentTarget` and `longArcGoals`,
+  with rough time horizon. If none, say "General fitness — no specific event."
+- "This week's structure" — realistic week shape given the captured `lifePatterns`,
+  `timeBudget`, and `workArounds`. Reference solo-parent days, work travel, etc. when
+  relevant. Keep concrete (e.g. "Mon strength, Tue rest, Wed turbo, ...") rather than
+  abstract.
+- Total under 700 words. The file is consumed by AI assistants, not humans.
+- No fabrication. If a data point is missing, omit it rather than inventing."""
+
+HEALTH_FOCUS_PROMPT = """You compile a personal `health.focus.md` file capturing the
+athlete's CURRENT health state. Output GitHub-flavored markdown only — no code fences
+around the whole document, no preamble, no commentary. Follow the EXACT section structure.
+
+OUTPUT FORMAT:
+# Current Health State: {NAME}
+## Current trends
+## Active focus
+## Things to watch
+## Last updated: {DATE}
+
+PRINCIPLES:
+- "Current trends" — 7-14 day direction in sleep duration, RHR, HRV, weight. Talk
+  direction (improving / stable / declining) with a number or two for anchor; don't
+  dump raw timeseries. Reference the athlete's captured `goodSleep` baseline when
+  commenting on current sleep.
+- "Active focus" — what the athlete is currently testing or watching, taken from
+  captured `activeConcerns` and `sleepSituation`.
+- "Things to watch" — concrete signals to flag if they trip: e.g. "RHR creeping above
+  baseline 5+ days," "HRV declining a week," "weight drift outside usual range."
+  Tie these to the athlete's stated `recoveryFactors` and `healthHistory` where possible.
+- Total under 500 words.
+- No fabrication. Omit rather than invent."""
+
+
+def _capture_for(uid: str, domain: str) -> dict:
+    """Return a dict of {questionId: answer} for the given AI Context capture domain."""
+    user = db.document(f'users/{uid}').get().to_dict() or {}
+    raw = (user.get('aiContextCapture') or {}).get(domain) or {}
+    out = {}
+    for qid, entry in raw.items():
+        if isinstance(entry, dict):
+            ans = (entry.get('answer') or '').strip()
+            if ans:
+                out[qid] = ans
+    return out
+
+
+def _recent_wellness(uid: str, days: int = 14) -> list:
+    """Recent wellness entries for the past N days, newest first."""
+    today = date.today()
+    out = []
+    for i in range(days):
+        d = (today - timedelta(days=i)).isoformat()
+        snap = db.document(f'users/{uid}/wellnessDaily/{d}').get()
+        if snap.exists:
+            data = snap.to_dict()
+            data['_date'] = d
+            out.append(data)
+    return out
+
+
+def _recent_activities_for_compile(uid: str, days: int = 14) -> list:
+    """Activities in the last N days, newest first; trimmed for prompt size."""
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    q = (
+        db.collection(f'users/{uid}/activities')
+        .order_by('startTimeLocal', direction='DESCENDING')
+        .limit(60)
+    )
+    out = []
+    for doc_snap in q.stream():
+        d = doc_snap.to_dict() or {}
+        start = (d.get('startTimeLocal') or '')[:10]
+        if start < cutoff:
+            continue
+        out.append({
+            'date': start,
+            'sport': d.get('activityType', {}).get('typeKey') if isinstance(d.get('activityType'), dict) else d.get('rawType'),
+            'name': d.get('activityName'),
+            'durationMin': round((d.get('duration') or 0) / 60),
+            'distanceKm': round((d.get('distance') or 0) / 1000, 1),
+            'avgHR': d.get('averageHR'),
+            'avgPower': d.get('averagePower'),
+            'tss': d.get('tss'),
+            'intensityFactor': d.get('intensityFactor'),
+        })
+    return out
+
+
+def _latest_plan(uid: str) -> dict | None:
+    """Most recent training plan, if any."""
+    q = (
+        db.collection(f'users/{uid}/trainingPlans')
+        .order_by('createdAt', direction='DESCENDING')
+        .limit(1)
+    )
+    for doc_snap in q.stream():
+        return doc_snap.to_dict()
+    return None
+
+
+def _name_for(uid: str) -> str:
+    user = db.document(f'users/{uid}').get().to_dict() or {}
+    return user.get('displayName') or user.get('email', '').split('@')[0] or 'Athlete'
+
+
+def _persist_ai_context_file(uid: str, file_id: str, domain: str, kind: str, content: str) -> None:
+    db.document(f'users/{uid}/aiContext/{file_id}').set({
+        'fileId': file_id,
+        'domain': domain,
+        'kind': kind,
+        'content': content,
+        'generatedAt': firestore.SERVER_TIMESTAMP,
+        'generatedBy': 'claude-sonnet-4-5-20250929',
+    }, merge=True)
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=120,
+    secrets=[ANTHROPIC_KEY_SECRET],
+)
+def ai_compile_training_focus(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    name = _name_for(uid)
+    today_iso = date.today().isoformat()
+    user_doc = db.document(f'users/{uid}').get().to_dict() or {}
+    profile = user_doc.get('profile') or {}
+    capture = _capture_for(uid, 'training')
+    activities = _recent_activities_for_compile(uid, days=10)
+    wellness_today = (_recent_wellness(uid, days=1) or [{}])[0]
+    plan = _latest_plan(uid)
+    plan_summary = None
+    if plan:
+        plan_summary = {
+            'weekStartDate': plan.get('weekStartDate'),
+            'summary': plan.get('summary'),
+            'focusAreas': plan.get('focusAreas'),
+            'totalPlannedMinutes': plan.get('totalPlannedMinutes'),
+            'sessions': [
+                {
+                    'day': s.get('day'),
+                    'type': s.get('type'),
+                    'title': s.get('title'),
+                    'durationMinutes': s.get('durationMinutes'),
+                    'completed': s.get('completed'),
+                }
+                for s in (plan.get('sessions') or [])
+            ],
+        }
+
+    payload = {
+        'name': name,
+        'today': today_iso,
+        'profile': {
+            'ftp': profile.get('ftp'),
+            'weight': profile.get('weight'),
+            'age': profile.get('age'),
+            'gender': profile.get('gender'),
+            'thresholdHR': profile.get('thresholdHR'),
+        },
+        'currentMetrics': {
+            'ctl': wellness_today.get('ctl'),
+            'atl': wellness_today.get('atl'),
+            'form': (wellness_today.get('ctl') or 0) - (wellness_today.get('atl') or 0)
+                    if wellness_today.get('ctl') is not None or wellness_today.get('atl') is not None else None,
+            'restingHR': wellness_today.get('restingHR'),
+            'hrv': wellness_today.get('hrv') or wellness_today.get('hrvSDNN'),
+        },
+        'capturedContext': capture,
+        'recentActivities': activities,
+        'currentPlan': plan_summary,
+    }
+
+    client = _get_anthropic_client()
+    response = client.messages.create(
+        model='claude-sonnet-4-5-20250929',
+        max_tokens=2000,
+        system=TRAINING_FOCUS_PROMPT.replace('{NAME}', name).replace('{DATE}', today_iso),
+        messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
+    )
+    content = response.content[0].text.strip()
+    _persist_ai_context_file(uid, 'training_focus', 'training', 'focus', content)
+    return {'status': 'ok', 'fileId': 'training_focus', 'characters': len(content)}
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=120,
+    secrets=[ANTHROPIC_KEY_SECRET],
+)
+def ai_compile_health_focus(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    name = _name_for(uid)
+    today_iso = date.today().isoformat()
+    capture = _capture_for(uid, 'health')
+    wellness_recent = _recent_wellness(uid, days=14)
+
+    # Trim wellness to fields relevant to the prompt (avoid blowing payload size)
+    trimmed = []
+    for w in wellness_recent:
+        trimmed.append({
+            'date': w.get('_date'),
+            'sleepHours': round((w.get('sleepSecs') or 0) / 3600, 1) if w.get('sleepSecs') else None,
+            'sleepScore': w.get('sleepScore'),
+            'restingHR': w.get('restingHR'),
+            'hrv': w.get('hrv') or w.get('hrvSDNN'),
+            'weight': w.get('weight'),
+        })
+
+    payload = {
+        'name': name,
+        'today': today_iso,
+        'capturedContext': capture,
+        'wellnessLast14Days': trimmed,
+    }
+
+    client = _get_anthropic_client()
+    response = client.messages.create(
+        model='claude-sonnet-4-5-20250929',
+        max_tokens=1500,
+        system=HEALTH_FOCUS_PROMPT.replace('{NAME}', name).replace('{DATE}', today_iso),
+        messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
+    )
+    content = response.content[0].text.strip()
+    _persist_ai_context_file(uid, 'health_focus', 'health', 'focus', content)
+    return {'status': 'ok', 'fileId': 'health_focus', 'characters': len(content)}
+
+
+# ══════════════════════════════════════════════════════
 # COMPUTE ACTIVITY STATS (Nightly)
 # ══════════════════════════════════════════════════════
 

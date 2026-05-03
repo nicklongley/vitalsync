@@ -85,6 +85,15 @@ service cloud.firestore {
       allow write: if false; // Computed by Cloud Functions
     }
 
+    // ── AI CONTEXT (.me/.focus generated files) ──
+    // Cloud Functions create + regenerate. Client can edit content directly.
+    match /users/{uid}/aiContext/{fileId} {
+      allow read: if isOwner(uid);
+      allow create: if false;
+      allow update: if isOwner(uid);
+      allow delete: if false;
+    }
+
     // ── TRENDS ──
     match /users/{uid}/trends/{trendId} {
       allow read: if isOwner(uid);
