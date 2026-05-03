@@ -3,10 +3,11 @@
 // Manual health entries: weight, blood pressure, mood, notes
 // ══════════════════════════════════════════════════════
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
+import { useNavigation } from '@/contexts/NavigationContext';
 import { useHealthLog, useWeightHistory } from '@/hooks/useIntervalsData';
 import { DateEntryPicker } from '@/components/shared';
 
@@ -29,9 +30,16 @@ const MOOD_OPTIONS = [
 
 export default function HealthLogTab() {
   const { user } = useAuth();
+  const { consumeHealthLogIntent } = useNavigation();
   const { entries, loading } = useHealthLog(null, 20);
   const { entries: syncedWeights } = useWeightHistory(30);
   const [activeType, setActiveType] = useState('weight');
+
+  // Apply cross-tab intent (e.g. Dashboard "How are you feeling?" → mood)
+  useEffect(() => {
+    const intent = consumeHealthLogIntent();
+    if (intent?.type) setActiveType(intent.type);
+  }, [consumeHealthLogIntent]);
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);

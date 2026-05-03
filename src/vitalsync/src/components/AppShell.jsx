@@ -1,5 +1,6 @@
-import { useState, lazy, Suspense } from 'react';
+import { lazy, Suspense } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
+import { NavigationProvider, useNavigation } from '@/contexts/NavigationContext';
 
 // Dashboard loads eagerly (first tab seen)
 import DashboardTab from '@/components/tabs/DashboardTab';
@@ -41,7 +42,15 @@ function TabFallback() {
 }
 
 export default function AppShell() {
-  const [activeTab, setActiveTab] = useState('Dashboard');
+  return (
+    <NavigationProvider>
+      <AppShellInner />
+    </NavigationProvider>
+  );
+}
+
+function AppShellInner() {
+  const { activeTab, setActiveTab } = useNavigation();
   const { user } = useAuth();
 
   const TabContent = TAB_COMPONENTS[activeTab];

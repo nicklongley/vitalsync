@@ -6,8 +6,18 @@
 
 import { useState, useMemo, useCallback } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
-import { useActivityStats, useIntervalsSync } from '@/hooks/useIntervalsData';
+import { useActivityStats, useIntervalsSync, useRecentActivities } from '@/hooks/useIntervalsData';
 import { ActionPrompt } from '@/components/shared';
+import ActivityDetail from '@/components/ActivityDetail';
+
+const SPORT_ICONS = {
+  running: '🏃', trail_running: '🏃', treadmill_running: '🏃', track_running: '🏃',
+  cycling: '🚴', road_biking: '🚴', indoor_cycling: '🚴', virtual_ride: '🚴',
+  mountain_biking: '🚴', gravel_cycling: '🚴',
+  swimming: '🏊', open_water_swimming: '🏊', lap_swimming: '🏊',
+  strength_training: '🏋️', walking: '🚶', hiking: '⛰️', yoga: '🧘',
+  elliptical: '🏋️', stair_climbing: '🧗', rowing: '🚣', other: '🎯',
+};
 
 const PERIODS = ['week', 'month', 'year'];
 const SPORTS = [
@@ -120,10 +130,25 @@ export default function HistoryTab() {
   const [periodIndex, setPeriodIndex] = useState(0);
   const [backfilling, setBackfilling] = useState(false);
   const [backfillMsg, setBackfillMsg] = useState('');
+  const [selectedActivityId, setSelectedActivityId] = useState(null);
+  const [activityLogLimit, setActivityLogLimit] = useState(25);
 
   const count = period === 'week' ? 60 : period === 'month' ? 25 : 20;
   const { stats, loading } = useActivityStats(period, count);
   const { connected, backfillHistory, computeStats } = useIntervalsSync();
+  const { activities: recentActivities } = useRecentActivities(activityLogLimit);
+
+  // Filter activities by selected sport
+  const filteredActivities = useMemo(() => {
+    if (sport === 'all') return recentActivities;
+    const allowed = SPORT_TYPE_MAP[sport];
+    return recentActivities.filter(a => {
+      const t = a.activityType?.typeKey || '';
+      if (allowed) return allowed.includes(t);
+      // 'other' bucket: types not in any defined SPORT_TYPE_MAP list
+      return !KNOWN_TYPES.has(t);
+    });
+  }, [recentActivities, sport]);
 
   const handlePeriodChange = (p) => { setPeriod(p); setPeriodIndex(0); };
 
@@ -200,6 +225,10 @@ export default function HistoryTab() {
 
   const hasStats = stats.length > 0;
   const sportLabel = SPORTS.find(s => s.id === sport)?.label || sport;
+
+  if (selectedActivityId) {
+    return <ActivityDetail activityId={selectedActivityId} onBack={() => setSelectedActivityId(null)} />;
+  }
 
   // Hero stat cards — show only vs previous period (YoY is in the dedicated table)
   const heroStats = [
@@ -420,6 +449,56 @@ export default function HistoryTab() {
             </div>
           )}
         </>
+      )}
+
+      {/* Activity Log — clickable list of recent activities */}
+      {connected && filteredActivities.length > 0 && (
+        <div className="glass-card p-4">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs text-slate-400 uppercase tracking-wider">Activity Log</p>
+            <p className="text-[10px] text-slate-600">
+              {filteredActivities.length}{sport !== 'all' ? ` ${sportLabel.toLowerCase()}` : ''}
+            </p>
+          </div>
+          <div className="-mx-2">
+            {filteredActivities.map((act) => {
+              const typeKey = act.activityType?.typeKey || '';
+              const icon = SPORT_ICONS[typeKey] || '🎯';
+              const km = act.distance ? (act.distance / 1000).toFixed(1) : null;
+              const min = act.duration ? Math.round(act.duration / 60) : null;
+              return (
+                <button
+                  key={act.id}
+                  onClick={() => setSelectedActivityId(act.id)}
+                  className="w-full flex items-center gap-3 px-2 py-2 border-b border-slate-800/40 last:border-0
+                             hover:bg-slate-800/30 transition-colors rounded-lg text-left min-h-[44px]"
+                >
+                  <span className="text-lg flex-shrink-0">{icon}</span>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm text-white font-medium truncate">{act.activityName || 'Activity'}</p>
+                    <p className="text-[10px] text-slate-500">
+                      {(act.startTimeLocal || '').replace('T', ' ').slice(0, 16)}
+                      {km ? ` · ${km} km` : ''}
+                      {min ? ` · ${min}min` : ''}
+                      {act.averageHR ? ` · ${Math.round(act.averageHR)} bpm` : ''}
+                      {act.averagePower ? ` · ${Math.round(act.averagePower)} W` : ''}
+                    </p>
+                  </div>
+                  <span className="text-slate-600 text-xs">›</span>
+                </button>
+              );
+            })}
+          </div>
+          {recentActivities.length >= activityLogLimit && activityLogLimit < 200 && (
+            <button
+              onClick={() => setActivityLogLimit(n => Math.min(n + 25, 200))}
+              className="w-full mt-3 py-2 rounded-lg text-xs text-slate-400 bg-slate-800 hover:bg-slate-700
+                         transition-colors min-h-[36px]"
+            >
+              Load more
+            </button>
+          )}
+        </div>
       )}
 
       {/* Backfill button — at bottom, less prominent */}

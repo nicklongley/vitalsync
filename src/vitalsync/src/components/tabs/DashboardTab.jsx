@@ -12,8 +12,10 @@ import {
 import { db } from '@/lib/firebase';
 import { useTodayWellness, useWeekWellness, useIntervalsSync, useRecentActivities } from '@/hooks/useIntervalsData';
 import { useAuth } from '@/contexts/AuthContext';
+import { useNavigation } from '@/contexts/NavigationContext';
 import { GaugeRing, MetricCard, ActionPrompt, InterventionCard } from '@/components/shared';
 import SyncProgress from '@/components/SyncProgress';
+import ActivityDetail from '@/components/ActivityDetail';
 
 // ── Wellness field readers (intervals.icu native, with garminDailies fallback) ──
 function readRestingHR(d) {
@@ -72,6 +74,7 @@ function readWeight(d) {
 
 export default function DashboardTab() {
   const { user, userSettings } = useAuth();
+  const { goToHealthLog, setActiveTab } = useNavigation();
   const { data: todayData, loading } = useTodayWellness();
   const { data: weekData } = useWeekWellness();
   const { connected, backfillStatus, backfillProgress, syncing, syncNow, lastSyncAt } = useIntervalsSync();
@@ -79,6 +82,7 @@ export default function DashboardTab() {
   const [dismissedPrompts, setDismissedPrompts] = useState([]);
   const [interventions, setInterventions] = useState([]);
   const [loadingInterventions, setLoadingInterventions] = useState(true);
+  const [selectedActivityId, setSelectedActivityId] = useState(null);
 
   useEffect(() => {
     if (!user) return;
@@ -174,6 +178,10 @@ export default function DashboardTab() {
 
   function dismiss(key) {
     setDismissedPrompts(prev => [...prev, key]);
+  }
+
+  if (selectedActivityId) {
+    return <ActivityDetail activityId={selectedActivityId} onBack={() => setSelectedActivityId(null)} />;
   }
 
   return (
@@ -325,6 +333,7 @@ export default function DashboardTab() {
               title="Log your weight"
               subtitle="Keeping weight up-to-date improves W/kg accuracy and body composition trends."
               cta="Log now"
+              ctaAction={() => goToHealthLog({ type: 'weight' })}
               accent="emerald"
               onDismiss={() => dismiss('weight')}
             />
@@ -335,6 +344,7 @@ export default function DashboardTab() {
               title="How are you feeling?"
               subtitle="A quick check-in helps the AI spot patterns between stress and recovery."
               cta="Check in"
+              ctaAction={() => goToHealthLog({ type: 'mood' })}
               accent="violet"
               onDismiss={() => dismiss('mood')}
             />
@@ -345,6 +355,7 @@ export default function DashboardTab() {
               title="Sleep trending low"
               subtitle={`${Math.floor(sleepSecs / 3600)}h ${Math.round((sleepSecs % 3600) / 60)}m last night. Aim for 7+ hours for better recovery.`}
               cta="See sleep"
+              ctaAction={() => setActiveTab('Insights')}
               accent="rose"
               onDismiss={() => dismiss('sleep')}
             />
@@ -393,7 +404,12 @@ export default function DashboardTab() {
           const typeKey = act.activityType?.typeKey || act.sport || '';
           const sportIcon = SPORT_ICONS[typeKey] || '🏃';
           return (
-            <div key={act.id || i} className="flex items-center gap-3 py-2 border-b border-slate-800/50 last:border-0">
+            <button
+              key={act.id || i}
+              onClick={() => setSelectedActivityId(act.id)}
+              className="w-full text-left flex items-center gap-3 py-2 border-b border-slate-800/50 last:border-0
+                         hover:bg-slate-800/30 transition-colors -mx-2 px-2 rounded-lg min-h-[44px]"
+            >
               <span className="text-lg">{sportIcon}</span>
               <div className="flex-1 min-w-0">
                 <p className="text-sm text-white font-medium truncate">{act.activityName || act.name}</p>
@@ -406,7 +422,8 @@ export default function DashboardTab() {
               {(act.averageHR || act.hr) && (
                 <span className="text-[10px] text-slate-400 font-mono">{act.averageHR || act.hr} bpm</span>
               )}
-            </div>
+              <span className="text-slate-600 text-xs">›</span>
+            </button>
           );
         })}
       </div>

@@ -619,6 +619,72 @@ def intervals_backfill(req: https_fn.CallableRequest) -> dict:
 
 
 # ══════════════════════════════════════════════════════
+# ACTIVITY STREAMS (lazy fetch from intervals.icu)
+# ══════════════════════════════════════════════════════
+
+_DEFAULT_STREAM_TYPES = 'time,watts,heartrate,cadence,altitude,distance,velocity_smooth'
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=60,
+    secrets=[ENCRYPTION_KEY_SECRET],
+)
+def intervals_get_activity_streams(req: https_fn.CallableRequest) -> dict:
+    """Fetch activity streams (HR, power, cadence, etc.) from intervals.icu on demand.
+    Streams are not persisted to Firestore — they're only loaded when a user opens
+    an activity detail page. Returns a dict keyed by stream type name with
+    parallel-array values (i.e. data[i] across types is the same time sample).
+    """
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    intervals_id = req.data.get('intervalsId')
+    if not intervals_id:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='intervalsId is required',
+        )
+    types = req.data.get('types') or _DEFAULT_STREAM_TYPES
+
+    api_key = _get_user_api_key(uid)
+    try:
+        result = _intervals_request(
+            api_key,
+            f'/activity/{intervals_id}/streams',
+            params={'types': types},
+            default=[],
+        )
+    except IntervalsAuthError:
+        db.document(f'users/{uid}').set({
+            'intervals': {'needs_reauth': True},
+        }, merge=True)
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='intervals.icu rejected the API key.',
+        )
+
+    # intervals.icu returns a list of {type, name, valueType, data: [...]} objects.
+    # Flatten into a dict keyed by type name for easier consumption client-side.
+    streams = {}
+    if isinstance(result, list):
+        for stream in result:
+            if isinstance(stream, dict):
+                t = stream.get('type')
+                data = stream.get('data')
+                if t and isinstance(data, list):
+                    # Cap at 5000 samples to keep payload reasonable for charts
+                    streams[t] = data[:5000] if len(data) > 5000 else data
+
+    return {'status': 'ok', 'streams': streams}
+
+
+# ══════════════════════════════════════════════════════
 # TRAINING PLAN → INTERVALS.ICU PUSH
 # ══════════════════════════════════════════════════════
 

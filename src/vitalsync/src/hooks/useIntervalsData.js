@@ -182,6 +182,12 @@ export function useIntervalsSync() {
     return fn({ planId });
   }
 
+  async function getActivityStreams(intervalsId, types) {
+    if (!user || !connected) throw new Error('Connect intervals.icu first');
+    const fn = httpsCallable(functions, 'intervals_get_activity_streams');
+    return fn({ intervalsId, types });
+  }
+
   async function computeStats() {
     if (!user) return null;
     const fn = httpsCallable(functions, 'compute_stats_on_demand');
@@ -201,6 +207,7 @@ export function useIntervalsSync() {
     disconnectIntervals,
     backfillHistory,
     pushPlan,
+    getActivityStreams,
     computeStats,
   };
 }
