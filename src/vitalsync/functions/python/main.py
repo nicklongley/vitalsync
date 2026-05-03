@@ -259,61 +259,103 @@ def _map_intervals_activity(act: dict) -> dict:
 def _refresh_athlete_profile(uid: str, api_key: str) -> dict:
     """Pull FTP / threshold HR / max HR / threshold pace from intervals.icu and persist
     them onto users/{uid}.profile so the rest of the app (Dashboard, AI Context, plan
-    generation) can read them. Returns the update dict applied (empty if nothing).
+    generation) can read them. Each field gets a {field}Source flag — 'intervals' when
+    we pulled it, 'manual' when the user overrode in Settings. Manual sources are never
+    overwritten. Returns the update dict applied (empty if nothing).
     """
+    # Try /sport-settings first — per-sport FTP, LTHR, max HR, threshold pace
+    sport_settings = []
     try:
-        result = _intervals_request(api_key, '/athlete/0/profile', default={}) or {}
+        ss_result = _intervals_request(api_key, '/athlete/0/sport-settings', default=None)
+        if isinstance(ss_result, list):
+            sport_settings = ss_result
+        elif isinstance(ss_result, dict):
+            sport_settings = ss_result.get('sport_settings') or ss_result.get('sportSettings') or []
+        print(f'intervals sport-settings: {len(sport_settings)} entries')
     except IntervalsAuthError:
         raise
     except Exception as e:
-        print(f'Failed to fetch intervals athlete profile: {e}')
-        return {}
+        print(f'sport-settings fetch failed: {e}')
 
-    # Response shape varies — try both flat and nested {athlete: {...}} forms
-    athlete = result.get('athlete') if isinstance(result.get('athlete'), dict) else result
-    if not isinstance(athlete, dict):
-        return {}
+    # Also fetch the athlete object for weight + general fields
+    athlete = {}
+    for path in ('/athlete/0', '/athlete/0/profile'):
+        try:
+            r = _intervals_request(api_key, path, default=None)
+        except IntervalsAuthError:
+            raise
+        except Exception as e:
+            print(f'{path} fetch failed: {e}')
+            continue
+        if not r:
+            continue
+        if isinstance(r, dict):
+            inner = r.get('athlete') if isinstance(r.get('athlete'), dict) else r
+            if isinstance(inner, dict) and inner:
+                athlete = inner
+                print(f'athlete keys from {path}: {list(athlete.keys())[:30]}')
+                break
 
-    update = {}
+    # Pick from sport settings (Ride is primary for FTP; HR/maxHR from any sport that has them)
+    def _from_settings(sport_id, *keys):
+        for s in sport_settings:
+            sid = s.get('id') or s.get('sportId') or s.get('sport')
+            if sid == sport_id:
+                for k in keys:
+                    v = s.get(k)
+                    if v not in (None, 0, ''):
+                        return v
+        return None
 
-    def _pick(*keys):
+    def _from_athlete(*keys):
         for k in keys:
             v = athlete.get(k)
-            if v is not None and v != 0 and v != '':
+            if v not in (None, 0, ''):
                 return v
         return None
 
-    ftp = _pick('icu_ftp', 'ftp', 'ftpw')
+    proposed = {}
+
+    ftp = _from_settings('Ride', 'ftp', 'icu_ftp', 'indoor_ftp') or _from_athlete('icu_ftp', 'ftp')
     if ftp and ftp > 0:
-        update['ftp'] = int(ftp)
-        update['ftpSource'] = 'intervals'
+        proposed['ftp'] = int(ftp)
 
-    lthr = _pick('lthr', 'icu_lthr', 'thresholdHr', 'threshold_hr')
+    lthr = (_from_settings('Ride', 'lthr', 'icu_lthr')
+            or _from_settings('Run', 'lthr', 'icu_lthr')
+            or _from_athlete('lthr', 'icu_lthr'))
     if lthr and lthr > 0:
-        update['thresholdHR'] = int(lthr)
+        proposed['thresholdHR'] = int(lthr)
 
-    max_hr = _pick('max_heartrate', 'icu_max_heartrate', 'maxHr')
+    max_hr = (_from_settings('Ride', 'max_hr', 'maxHr')
+              or _from_settings('Run', 'max_hr', 'maxHr')
+              or _from_athlete('max_heartrate', 'icu_max_heartrate', 'maxHr'))
     if max_hr and max_hr > 0:
-        update['maxHR'] = int(max_hr)
+        proposed['maxHR'] = int(max_hr)
 
-    resting_hr = _pick('icu_resting_hr', 'restingHr')
+    resting_hr = _from_athlete('icu_resting_hr', 'restingHr')
     if resting_hr and resting_hr > 0:
-        update['restingHR'] = int(resting_hr)
+        proposed['restingHR'] = int(resting_hr)
 
-    threshold_pace = _pick('threshold_pace', 'icu_threshold_pace')
+    threshold_pace = _from_settings('Run', 'threshold_pace', 'thresholdPace')
     if threshold_pace and threshold_pace > 0:
-        update['thresholdPace'] = threshold_pace
+        proposed['thresholdPace'] = float(threshold_pace)
 
-    weight = _pick('weight', 'icu_weight')
-    if weight and weight > 0 and not update.get('weight'):
-        # Only set weight if intervals.icu has it AND the existing weight came from intervals/empty
-        # (don't clobber a recent manual entry)
-        user_doc = db.document(f'users/{uid}').get().to_dict() or {}
-        existing = (user_doc.get('profile') or {}).get('weight')
-        existing_source = (user_doc.get('profile') or {}).get('weightSource')
-        if not existing or existing_source == 'intervals':
-            update['weight'] = round(float(weight), 1)
-            update['weightSource'] = 'intervals'
+    weight = _from_athlete('weight', 'icu_weight')
+    if weight and weight > 0:
+        proposed['weight'] = round(float(weight), 1)
+
+    print(f'intervals proposed profile: {proposed}')
+
+    # Respect manual overrides — never overwrite a field marked source='manual'
+    user_doc = db.document(f'users/{uid}').get().to_dict() or {}
+    existing_profile = user_doc.get('profile') or {}
+    update = {}
+    for field, value in proposed.items():
+        source_key = f'{field}Source'
+        if existing_profile.get(source_key) == 'manual':
+            continue
+        update[field] = value
+        update[source_key] = 'intervals'
 
     if update:
         try:

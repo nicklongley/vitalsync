@@ -4,7 +4,7 @@
 // ══════════════════════════════════════════════════════
 
 import { useState, useEffect } from 'react';
-import { doc, setDoc } from 'firebase/firestore';
+import { doc, setDoc, deleteField } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
@@ -254,6 +254,21 @@ export default function SettingsTab() {
         <p className="text-[10px] text-slate-600 mt-2">
           Used for W/kg, age-adjusted performance, and calorie estimates.
         </p>
+      </div>
+
+      {/* ── Performance Metrics ── */}
+      <div className="glass-card p-5">
+        <p className="text-xs text-slate-400 uppercase tracking-wider mb-1">Performance Metrics</p>
+        <p className="text-[10px] text-slate-600 mb-4">
+          Auto-synced from intervals.icu. Override any value manually — manual entries are never overwritten by sync.
+        </p>
+        <div className="space-y-2">
+          <PerformanceMetricRow uid={user?.uid} profile={userSettings?.profile || {}} field="ftp" label="FTP" unit="W" step="1" />
+          <PerformanceMetricRow uid={user?.uid} profile={userSettings?.profile || {}} field="thresholdHR" label="Threshold HR" unit="bpm" step="1" />
+          <PerformanceMetricRow uid={user?.uid} profile={userSettings?.profile || {}} field="maxHR" label="Max HR" unit="bpm" step="1" />
+          <PerformanceMetricRow uid={user?.uid} profile={userSettings?.profile || {}} field="restingHR" label="Resting HR" unit="bpm" step="1" />
+          <PerformanceMetricRow uid={user?.uid} profile={userSettings?.profile || {}} field="thresholdPace" label="Threshold Pace" unit="s/km" step="0.1" displayHint="seconds per km" />
+        </div>
       </div>
 
       {/* ── intervals.icu Connection ── */}
@@ -523,6 +538,147 @@ export default function SettingsTab() {
                    text-slate-300 hover:bg-slate-700 transition-colors min-h-[44px]">
         Sign Out
       </button>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────
+// Performance metric row: shows current value + source badge,
+// allows manual override (sets {field}Source: 'manual'), and a
+// "Use intervals" button to clear the override.
+// ──────────────────────────────────────────────────────────────
+function PerformanceMetricRow({ uid, profile, field, label, unit, step = '1', displayHint }) {
+  const value = profile?.[field];
+  const source = profile?.[`${field}Source`];
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  function start() {
+    setDraft(value != null ? String(value) : '');
+    setEditing(true);
+  }
+
+  async function save() {
+    if (!uid) return;
+    const num = parseFloat(draft);
+    if (Number.isNaN(num) || num <= 0) return;
+    setSaving(true);
+    try {
+      await setDoc(doc(db, 'users', uid), {
+        profile: {
+          [field]: num,
+          [`${field}Source`]: 'manual',
+        },
+      }, { merge: true });
+      setEditing(false);
+    } catch (err) {
+      console.error(`Failed to save ${field}:`, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function clearManual() {
+    if (!uid) return;
+    setSaving(true);
+    try {
+      await setDoc(doc(db, 'users', uid), {
+        profile: {
+          [field]: deleteField(),
+          [`${field}Source`]: deleteField(),
+        },
+      }, { merge: true });
+    } catch (err) {
+      console.error(`Failed to clear ${field}:`, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-wrap">
+            <p className="text-sm text-white font-medium">{label}</p>
+            {source === 'intervals' && value != null && (
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-400 border border-emerald-800/40 font-medium">
+                synced
+              </span>
+            )}
+            {source === 'manual' && (
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400 border border-amber-800/40 font-medium">
+                manual
+              </span>
+            )}
+            {value == null && (
+              <span className="text-[9px] text-slate-600">no value</span>
+            )}
+          </div>
+          {!editing && (
+            <p className="text-base font-mono text-slate-200 mt-0.5">
+              {value != null ? `${value} ${unit}` : '—'}
+            </p>
+          )}
+        </div>
+        {!editing && (
+          <div className="flex gap-1.5 flex-shrink-0">
+            {source === 'manual' && (
+              <button
+                onClick={clearManual}
+                disabled={saving}
+                title="Clear manual override and let intervals.icu sync this value"
+                className="px-2 py-1.5 rounded-lg text-[10px] bg-slate-800 border border-slate-700 text-slate-400 hover:bg-slate-700 transition-colors min-h-[32px]"
+              >
+                Use synced
+              </button>
+            )}
+            <button
+              onClick={start}
+              disabled={saving}
+              className="px-2 py-1.5 rounded-lg text-[10px] bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700 transition-colors min-h-[32px]"
+            >
+              {value != null ? 'Override' : 'Set'}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {editing && (
+        <div className="mt-2 space-y-2">
+          <div className="flex gap-2">
+            <input
+              type="number"
+              step={step}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              autoFocus
+              disabled={saving}
+              className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm font-mono
+                         focus:outline-none focus:border-emerald-600 transition-colors"
+            />
+            <span className="self-center text-xs text-slate-500">{unit}</span>
+          </div>
+          {displayHint && <p className="text-[9px] text-slate-600">{displayHint}</p>}
+          <div className="flex gap-2 justify-end">
+            <button
+              onClick={() => setEditing(false)}
+              disabled={saving}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-medium bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700 transition-colors min-h-[32px]"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={save}
+              disabled={saving}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-medium bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50 transition-colors min-h-[32px]"
+            >
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
