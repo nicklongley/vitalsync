@@ -167,6 +167,16 @@ export default function DashboardTab() {
     return { minutes: Math.round(secs / 60), calories: Math.round(cals), count };
   }, [activities]);
 
+  // Hide the mood check-in prompt if user has logged a mood entry in the last 7 days.
+  // Must be declared before the early return below to satisfy Hooks rules.
+  const hasRecentMoodCheckin = useMemo(() => {
+    if (!moodEntries?.length) return false;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 7);
+    const cutoffISO = cutoff.toISOString().slice(0, 10);
+    return moodEntries.some(e => (e.date || '') >= cutoffISO);
+  }, [moodEntries]);
+
   if (loading) {
     return (
       <div className="space-y-4 animate-fade-in">
@@ -199,15 +209,6 @@ export default function DashboardTab() {
   const activeDisplay = weekTotals.minutes >= 60
     ? { value: (weekTotals.minutes / 60).toFixed(1), unit: 'h' }
     : { value: weekTotals.minutes || 0, unit: 'min' };
-
-  // Hide the mood check-in prompt if user has logged a mood entry in the last 7 days
-  const hasRecentMoodCheckin = useMemo(() => {
-    if (!moodEntries?.length) return false;
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 7);
-    const cutoffISO = cutoff.toISOString().slice(0, 10);
-    return moodEntries.some(e => (e.date || '') >= cutoffISO);
-  }, [moodEntries]);
 
   function dismiss(key) {
     setDismissedPrompts(prev => [...prev, key]);
