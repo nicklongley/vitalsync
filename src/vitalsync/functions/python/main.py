@@ -1094,9 +1094,10 @@ PRINCIPLES:
 
 For each non-rest session, also output `workoutScript` — a structured workout in
 intervals.icu's workout-builder syntax. intervals.icu parses this and pushes a paired
-structured workout to the user's Garmin/Hammerhead. Get the syntax exactly right.
+structured workout to the user's Garmin/Hammerhead. The parser is strict — match the
+examples below exactly.
 
-CYCLING (type=cycle/Ride) example:
+CYCLING WORKOUT (type=cycle):
   Warmup
   - 10m 60%
   - 5m ramp 60%-80%
@@ -1108,29 +1109,58 @@ CYCLING (type=cycle/Ride) example:
   Cooldown
   - 10m 50%
 
-RUNNING (type=run/Run) example:
+RUNNING WORKOUT — HR-based (type=run):
   Warmup
   - 10m 65-70% HR
+
+  4x
+  - 3m 88-92% HR
+  - 2m 70% HR
+
+  Cooldown
+  - 10m 60-65% HR
+
+RUNNING WORKOUT — pace-based (type=run):
+  Warmup
+  - 10m Z2 HR
 
   Main
   - 30m 78-82% Pace
 
   Cooldown
-  - 10m 65% HR
+  - 10m Z2 HR
 
-SYNTAX RULES (strict — the parser is fussy):
-- Section headers ("Warmup", "Main", "Cooldown") are on their OWN line with NO leading dash
-- Each step line starts with "- " (dash then space) at column 0
-- Step format: "- <duration> <target> [optional cadence/note]"
-- Duration units: 30s, 5m, 1h30m (combine units, no spaces)
-- Repeat blocks: put "Nx" on its OWN line, then the steps below (no indentation needed)
-- Target by sport:
-    Cycling: bare "%" means %FTP (e.g. "90%"), or "220w" watts, or "Z2"/"Z3-Z4" zones
-    Running: explicit "% HR" / "% LTHR" / "% Pace" (NOT %FTP — that's cycling-only)
-    Swimming: explicit "% Pace" or pace like "1:30/100m Pace"
-- Use ranges (88-92%) instead of exact targets for outdoor sessions
-- Total of all step durations MUST equal durationMinutes
-- For strength, yoga, or active_recovery: set workoutScript to "" (empty)
+SWIMMING WORKOUT (type=swim):
+  Warmup
+  - 400mtr Z1 Pace
+
+  8x
+  - 100mtr 1:30/100m Pace
+  - 30s
+
+  Cooldown
+  - 200mtr Z1 Pace
+
+SYNTAX RULES — match exactly:
+1. Section headers ("Warmup", "Main", "Cooldown", "Cool down" etc.) on their OWN line
+   with NO leading dash and NO target on the same line.
+2. Each step line starts with "- " (dash then space) at the very start of the line.
+3. Step format: "- <duration> <target> [optional cadence/note]"
+4. Duration: "30s", "5m", "1h30m" (combine units, NEVER write "10min" or "10 minutes").
+5. Distance (swim/run by distance): "500mtr", "1km", "100m" — for swims with distance.
+6. Repeat blocks: "Nx" on its own line, then the steps below (no indentation).
+7. TARGET FORMAT — sport-specific. Get this right or the parser fails:
+   - Cycling (cycle/ride): bare "%" = %FTP (e.g. "90%", "100-105%"); also "220w", "Z2"
+   - Running (run): MUST use "% HR" (max HR), "% LTHR", "Z2 HR", "Z3 HR", "% Pace",
+     "Z2 Pace", or absolute pace like "5:00/km Pace". NEVER use bare "%" for runs —
+     bare "%" only works for cycling.
+   - Swimming (swim): "% Pace", "Z1 Pace", or absolute pace like "1:30/100m Pace".
+8. Spacing matters: write "70% HR" with the space, capital H and R. Same for "% LTHR",
+   "% Pace", "Z2 HR", "Z2 Pace".
+9. Use ranges ("88-92% HR") for outdoor sessions to avoid Garmin alert spam.
+10. Total of all step durations MUST equal durationMinutes.
+11. For strength, yoga, or active_recovery: set workoutScript to "" (empty string) —
+    these don't structure into device intervals.
 
 OUTPUT FORMAT (JSON only, no markdown fences):
 {
@@ -1149,7 +1179,7 @@ OUTPUT FORMAT (JSON only, no markdown fences):
       "warmUp": "5 min walk, dynamic stretches",
       "mainSet": "Description of main workout",
       "coolDown": "5 min walk, static stretches",
-      "workoutScript": "Warmup\\n- 10m 60%\\n\\n4x\\n- 3m 105%\\n- 2m 50%\\n\\nCooldown\\n- 10m 50%"
+      "workoutScript": "Warmup\\n- 10m 60%\\n\\n4x\\n- 3m 105%\\n- 2m 50%\\n\\nCooldown\\n- 10m 50%   // for runs use '% HR' not bare '%'"
     }
   ]
 }"""
