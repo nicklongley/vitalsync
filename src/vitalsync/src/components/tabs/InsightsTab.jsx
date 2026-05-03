@@ -7,18 +7,23 @@
 import { useState, useEffect, useMemo } from 'react';
 import { collection, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
-import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-} from 'recharts';
 import { db, functions } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
-import { useGarminWeek, useGarminSync } from '@/hooks/useGarminData';
+import { useWeekWellness, useIntervalsSync } from '@/hooks/useIntervalsData';
 import { GaugeRing, InterventionCard, ActionPrompt } from '@/components/shared';
+
+// ── Wellness field readers (intervals.icu native, garminDailies fallback) ──
+const readSleepSecs = (d) => d?.sleepSecs || d?.sleep?.sleepTimeSeconds || 0;
+const readRestingHR = (d) => d?.restingHR || d?.heartRates?.restingHeartRate || 0;
+const readSteps = (d) => d?.steps || d?.stats?.totalSteps || 0;
+const readSleepScore = (d) => d?.sleepScore || d?.sleep?.sleepScores?.overall?.value || d?.sleep?.sleepScore || 0;
+const readCTL = (d) => d?.ctl || 0;
+const readATL = (d) => d?.atl || 0;
 
 export default function InsightsTab() {
   const { user } = useAuth();
-  const { connected } = useGarminSync();
-  const { data: weekData } = useGarminWeek();
+  const { connected } = useIntervalsSync();
+  const { data: weekData } = useWeekWellness();
   const [interventions, setInterventions] = useState([]);
   const [loadingInterventions, setLoadingInterventions] = useState(true);
   const [analysing, setAnalysing] = useState(false);
@@ -52,11 +57,11 @@ export default function InsightsTab() {
     const result = [];
 
     // Sleep trend (last 3 days vs first 4 days)
-    const recentSleep = weekData.slice(4).filter(d => d.sleep?.sleepTimeSeconds);
-    const earlierSleep = weekData.slice(0, 4).filter(d => d.sleep?.sleepTimeSeconds);
+    const recentSleep = weekData.slice(4).filter(d => readSleepSecs(d));
+    const earlierSleep = weekData.slice(0, 4).filter(d => readSleepSecs(d));
     if (recentSleep.length > 0 && earlierSleep.length > 0) {
-      const recentAvg = recentSleep.reduce((s, d) => s + d.sleep.sleepTimeSeconds, 0) / recentSleep.length;
-      const earlierAvg = earlierSleep.reduce((s, d) => s + d.sleep.sleepTimeSeconds, 0) / earlierSleep.length;
+      const recentAvg = recentSleep.reduce((s, d) => s + readSleepSecs(d), 0) / recentSleep.length;
+      const earlierAvg = earlierSleep.reduce((s, d) => s + readSleepSecs(d), 0) / earlierSleep.length;
       const diffMin = Math.round((recentAvg - earlierAvg) / 60);
       result.push({
         icon: '\uD83D\uDE34',
@@ -69,11 +74,11 @@ export default function InsightsTab() {
     }
 
     // RHR trend
-    const recentHR = weekData.slice(4).filter(d => d.heartRates?.restingHeartRate);
-    const earlierHR = weekData.slice(0, 4).filter(d => d.heartRates?.restingHeartRate);
+    const recentHR = weekData.slice(4).filter(d => readRestingHR(d));
+    const earlierHR = weekData.slice(0, 4).filter(d => readRestingHR(d));
     if (recentHR.length > 0 && earlierHR.length > 0) {
-      const recentRHR = Math.round(recentHR.reduce((s, d) => s + d.heartRates.restingHeartRate, 0) / recentHR.length);
-      const earlierRHR = Math.round(earlierHR.reduce((s, d) => s + d.heartRates.restingHeartRate, 0) / earlierHR.length);
+      const recentRHR = Math.round(recentHR.reduce((s, d) => s + readRestingHR(d), 0) / recentHR.length);
+      const earlierRHR = Math.round(earlierHR.reduce((s, d) => s + readRestingHR(d), 0) / earlierHR.length);
       const diff = recentRHR - earlierRHR;
       result.push({
         icon: '\u2764\uFE0F',
@@ -83,65 +88,52 @@ export default function InsightsTab() {
       });
     }
 
-    // Steps trend
-    const recentSteps = weekData.slice(4).filter(d => d.stats?.totalSteps);
-    const earlierSteps = weekData.slice(0, 4).filter(d => d.stats?.totalSteps);
-    if (recentSteps.length > 0 && earlierSteps.length > 0) {
-      const recentAvg = Math.round(recentSteps.reduce((s, d) => s + d.stats.totalSteps, 0) / recentSteps.length);
-      const earlierAvg = Math.round(earlierSteps.reduce((s, d) => s + d.stats.totalSteps, 0) / earlierSteps.length);
-      const pct = Math.round(((recentAvg - earlierAvg) / (earlierAvg || 1)) * 100);
+    // Form (TSB) trend \u2014 intervals.icu native
+    const recentCTL = weekData.slice(4).filter(d => readCTL(d) || readATL(d));
+    const earlierCTL = weekData.slice(0, 4).filter(d => readCTL(d) || readATL(d));
+    if (recentCTL.length > 0 && earlierCTL.length > 0) {
+      const recentForm = Math.round(recentCTL.reduce((s, d) => s + (readCTL(d) - readATL(d)), 0) / recentCTL.length);
+      const earlierForm = Math.round(earlierCTL.reduce((s, d) => s + (readCTL(d) - readATL(d)), 0) / earlierCTL.length);
+      const diff = recentForm - earlierForm;
       result.push({
-        icon: '\uD83D\uDC63',
-        title: pct > 0 ? 'Activity increasing' : pct < 0 ? 'Activity decreasing' : 'Activity steady',
-        description: `Daily steps averaging ${recentAvg.toLocaleString()} (${pct > 0 ? '+' : ''}${pct}% vs start of week).`,
-        trend: pct > 0 ? 'up' : pct < 0 ? 'down' : 'stable',
+        icon: '\u26A1',
+        title: diff > 0 ? 'Form improving' : diff < 0 ? 'Form declining' : 'Form steady',
+        description: `Current Form ${recentForm > 0 ? '+' : ''}${recentForm} (${diff > 0 ? '+' : ''}${diff} vs start of week). ${recentForm > 5 ? 'Fresh \u2014 ready to push.' : recentForm < -10 ? 'Carrying fatigue \u2014 consider easier sessions.' : 'Balanced.'}`,
+        trend: diff > 0 ? 'up' : diff < 0 ? 'down' : 'stable',
       });
     }
 
     return result;
   }, [weekData]);
 
-  // Compute sleep chart from week data
-  const sleepChart = useMemo(() => {
-    if (!weekData || weekData.length === 0) return [];
-    return weekData.map(day => {
-      const sleep = day.sleep || {};
-      const deepSec = sleep.deepSleepSeconds || 0;
-      const lightSec = sleep.lightSleepSeconds || 0;
-      const remSec = sleep.remSleepSeconds || 0;
-      const dayLabel = day.date ? new Date(day.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'narrow' }) : '';
-      return {
-        day: dayLabel,
-        deep: parseFloat((deepSec / 3600).toFixed(1)),
-        light: parseFloat((lightSec / 3600).toFixed(1)),
-        rem: parseFloat((remSec / 3600).toFixed(1)),
-      };
-    });
-  }, [weekData]);
-
-  // Compute scorecard from week data
+  // Compute scorecard from week data (Body Battery removed \u2014 replaced with Form)
   const scorecard = useMemo(() => {
     if (!weekData || weekData.length === 0) return null;
-    const daysWithData = weekData.filter(d => d.stats || d.heartRates || d.sleep);
+    const daysWithData = weekData.filter(d => readSteps(d) || readRestingHR(d) || readSleepSecs(d) || readCTL(d));
     if (daysWithData.length === 0) return null;
 
-    const avgSteps = Math.round(daysWithData.filter(d => d.stats?.totalSteps).reduce((s, d) => s + (d.stats?.totalSteps || 0), 0) / (daysWithData.length || 1));
-    const avgSleep = daysWithData.filter(d => d.sleep?.sleepTimeSeconds).reduce((s, d) => s + (d.sleep?.sleepTimeSeconds || 0), 0) / (daysWithData.filter(d => d.sleep?.sleepTimeSeconds).length || 1);
-    const avgRHR = Math.round(daysWithData.filter(d => d.heartRates?.restingHeartRate).reduce((s, d) => s + (d.heartRates?.restingHeartRate || 0), 0) / (daysWithData.filter(d => d.heartRates?.restingHeartRate).length || 1));
-    const avgBattery = Math.round(daysWithData.filter(d => d.bodyBattery?.bodyBatteryHigh || d.stress?.bodyBatteryHigh).reduce((s, d) => s + (d.bodyBattery?.bodyBatteryHigh || d.stress?.bodyBatteryHigh || 0), 0) / (daysWithData.filter(d => d.bodyBattery?.bodyBatteryHigh || d.stress?.bodyBatteryHigh).length || 1));
+    const stepDays = daysWithData.filter(d => readSteps(d));
+    const sleepDays = daysWithData.filter(d => readSleepSecs(d));
+    const hrDays = daysWithData.filter(d => readRestingHR(d));
+    const ctlDays = daysWithData.filter(d => readCTL(d) || readATL(d));
 
-    // Simple scoring: 0-100 scale
+    const avgSteps = stepDays.length ? Math.round(stepDays.reduce((s, d) => s + readSteps(d), 0) / stepDays.length) : 0;
+    const avgSleep = sleepDays.length ? sleepDays.reduce((s, d) => s + readSleepSecs(d), 0) / sleepDays.length : 0;
+    const avgRHR = hrDays.length ? Math.round(hrDays.reduce((s, d) => s + readRestingHR(d), 0) / hrDays.length) : 0;
+    const avgForm = ctlDays.length ? ctlDays.reduce((s, d) => s + (readCTL(d) - readATL(d)), 0) / ctlDays.length : 0;
+
     const stepsScore = Math.min(100, Math.round((avgSteps / 10000) * 100));
     const sleepScore = Math.min(100, Math.round((avgSleep / (8 * 3600)) * 100));
     const rhrScore = avgRHR > 0 ? Math.min(100, Math.round(((100 - avgRHR) / 40) * 100)) : 0;
-    const batteryScore = avgBattery;
-    const overallScore = Math.round((stepsScore + sleepScore + rhrScore + batteryScore) / 4);
+    // Map Form -30..+20 \u2192 0..100
+    const formScore = Math.max(0, Math.min(100, Math.round(((avgForm + 30) / 50) * 100)));
+    const overallScore = Math.round((stepsScore + sleepScore + rhrScore + formScore) / 4);
 
     return [
       { label: 'Overall', score: overallScore, color: '#10b981' },
       { label: 'Activity', score: stepsScore, color: '#818cf8' },
       { label: 'Sleep', score: sleepScore, color: '#a78bfa' },
-      { label: 'Recovery', score: batteryScore, color: '#f59e0b' },
+      { label: 'Form', score: formScore, color: '#f59e0b' },
       { label: 'Heart', score: rhrScore, color: '#ef4444' },
     ];
   }, [weekData]);
@@ -183,12 +175,12 @@ export default function InsightsTab() {
     <div className="space-y-4">
       <h2 className="text-lg font-bold text-white">AI Insights</h2>
 
-      {/* Garmin not connected */}
+      {/* intervals.icu not connected */}
       {!connected && (
         <ActionPrompt
           icon={"\uD83E\uDDE0"}
-          title="AI insights require Garmin data"
-          subtitle="Connect your Garmin account to unlock AI-powered health analysis and coaching."
+          title="AI insights require training data"
+          subtitle="Connect your intervals.icu account to unlock AI-powered health analysis and coaching."
           cta="Go to Settings"
           accent="cyan"
           dismissible={false}
@@ -207,35 +199,12 @@ export default function InsightsTab() {
         </div>
       )}
 
-      {/* Sleep Stages Chart */}
-      {sleepChart.some(d => d.deep > 0 || d.light > 0) && (
-        <div className="glass-card p-4">
-          <p className="text-xs text-slate-400 uppercase tracking-wider mb-3">Sleep Stages - 7 Days</p>
-          <ResponsiveContainer width="100%" height={120}>
-            <BarChart data={sleepChart}>
-              <XAxis dataKey="day" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-              <YAxis hide />
-              <Tooltip contentStyle={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 12, fontSize: 12 }}
-                formatter={(v) => [`${v}h`, '']} />
-              <Bar dataKey="deep" stackId="a" fill="#4338ca" name="Deep" />
-              <Bar dataKey="light" stackId="a" fill="#818cf8" name="Light" />
-              <Bar dataKey="rem" stackId="a" fill="#c4b5fd" radius={[4, 4, 0, 0]} name="REM" />
-            </BarChart>
-          </ResponsiveContainer>
-          <div className="flex justify-center gap-4 mt-2">
-            <span className="text-[10px] text-slate-400 flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-indigo-700" /> Deep</span>
-            <span className="text-[10px] text-slate-400 flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-indigo-400" /> Light</span>
-            <span className="text-[10px] text-slate-400 flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-violet-300" /> REM</span>
-          </div>
-        </div>
-      )}
-
       {/* Daily Analysis */}
       <div className="glass-card p-4 space-y-3">
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm font-semibold text-white">Daily Analysis</p>
-            <p className="text-[10px] text-slate-500">AI reviews your Garmin data and generates insights</p>
+            <p className="text-[10px] text-slate-500">AI reviews your training data and generates insights</p>
           </div>
           <button
             onClick={runDailyAnalysis}
@@ -290,7 +259,7 @@ export default function InsightsTab() {
           <ActionPrompt
             icon={"\uD83E\uDDE0"}
             title="No insights yet"
-            subtitle="Run a daily analysis to generate AI-powered interventions based on your Garmin health data."
+            subtitle="Run a daily analysis to generate AI-powered interventions based on your training data."
             cta="Run Analysis"
             ctaAction={runDailyAnalysis}
             accent="emerald"
@@ -379,7 +348,7 @@ export default function InsightsTab() {
           </div>
         ) : (
           <p className="text-xs text-slate-500 text-center py-4">
-            Trends will appear once we have a few days of Garmin data to analyse.
+            Trends will appear once we have a few days of training data to analyse.
           </p>
         )}
       </div>

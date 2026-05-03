@@ -1,7 +1,6 @@
 // ══════════════════════════════════════════════════════
 // VITALSYNC — Settings Tab
-// Profile, Garmin, Goals, Availability, Preferences, Data
-// Design ref: vitalsync-dashboard.jsx lines 551-610
+// Profile, intervals.icu, Goals, Availability, Preferences, Data
 // ══════════════════════════════════════════════════════
 
 import { useState, useEffect } from 'react';
@@ -9,7 +8,7 @@ import { doc, setDoc } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
-import { useGarminSync } from '@/hooks/useGarminData';
+import { useIntervalsSync } from '@/hooks/useIntervalsData';
 
 const GOALS = [
   { id: 'improve_ftp', label: 'Build cycling FTP' },
@@ -35,24 +34,13 @@ const AI_PERSONALITIES = [
 
 export default function SettingsTab() {
   const { user, userSettings, signOut } = useAuth();
-  const { connected, needsReauth, connectGarmin, disconnectGarmin, lastSyncAt } = useGarminSync();
+  const { connected, needsReauth, connectIntervals, disconnectIntervals, lastSyncAt, displayName } = useIntervalsSync();
 
-  // Garmin connection form (browser cookie capture)
-  const [garminCookieHeader, setGarminCookieHeader] = useState('');
-  const [garminLoading, setGarminLoading] = useState(false);
-  const [garminError, setGarminError] = useState('');
-  const [showTokenHelp, setShowTokenHelp] = useState(false);
-
-  // Listen for cookies from the VitalSync Chrome extension
-  useEffect(() => {
-    function handleExtensionCookies(e) {
-      if (e.detail?.cookieHeader) {
-        setGarminCookieHeader(e.detail.cookieHeader);
-      }
-    }
-    window.addEventListener('vitalsync-garmin-cookies', handleExtensionCookies);
-    return () => window.removeEventListener('vitalsync-garmin-cookies', handleExtensionCookies);
-  }, []);
+  // intervals.icu connection form (API key)
+  const [apiKey, setApiKey] = useState('');
+  const [intervalsLoading, setIntervalsLoading] = useState(false);
+  const [intervalsError, setIntervalsError] = useState('');
+  const [showApiKeyHelp, setShowApiKeyHelp] = useState(false);
 
   // Export / Delete state
   const [exporting, setExporting] = useState(false);
@@ -158,23 +146,22 @@ export default function SettingsTab() {
     return sum + (slot.durationHours || 1.5);
   }, 0);
 
-  async function handleGarminConnect() {
-    if (!garminCookieHeader) return;
-    setGarminLoading(true);
-    setGarminError('');
+  async function handleIntervalsConnect() {
+    if (!apiKey) return;
+    setIntervalsLoading(true);
+    setIntervalsError('');
     try {
-      await connectGarmin(garminCookieHeader);
-      setGarminCookieHeader('');
+      await connectIntervals(apiKey.trim());
+      setApiKey('');
     } catch (err) {
-      setGarminError(err.message || 'Session validation failed');
+      setIntervalsError(err.message || 'API key validation failed');
     } finally {
-      setGarminLoading(false);
+      setIntervalsLoading(false);
     }
   }
 
-  async function handleGarminDisconnect() {
-    setShowDeleteConfirm(false);
-    await disconnectGarmin();
+  async function handleIntervalsDisconnect() {
+    await disconnectIntervals();
   }
 
   async function handleExport() {
@@ -269,64 +256,64 @@ export default function SettingsTab() {
         </p>
       </div>
 
-      {/* ── Garmin Connection ── */}
+      {/* ── intervals.icu Connection ── */}
       <div className="glass-card p-5">
-        <p className="text-xs text-slate-400 uppercase tracking-wider mb-3">Garmin Connection</p>
+        <p className="text-xs text-slate-400 uppercase tracking-wider mb-3">intervals.icu Connection</p>
         {connected && !needsReauth ? (
           <div className="space-y-3">
             <div className="flex items-center gap-2">
               <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-emerald-400 text-sm font-medium">Connected</span>
+              <span className="text-emerald-400 text-sm font-medium">Connected{displayName ? ` \u2014 ${displayName}` : ''}</span>
             </div>
             {lastSyncAt && (
               <p className="text-slate-400 text-xs">Last synced: {lastSyncAt.toLocaleString()}</p>
             )}
-            <button onClick={handleGarminDisconnect}
+            <button onClick={handleIntervalsDisconnect}
               className="text-rose-400 text-xs hover:text-rose-300 transition-colors py-2 min-h-[44px]">
-              Disconnect Garmin
+              Disconnect intervals.icu
             </button>
           </div>
         ) : (
           <div className="space-y-3">
             {needsReauth && (
               <div className="bg-amber-500/10 border border-amber-600/30 rounded-xl p-3">
-                <p className="text-amber-400 text-xs font-medium">Session expired</p>
+                <p className="text-amber-400 text-xs font-medium">API key invalid</p>
                 <p className="text-amber-400/70 text-[11px] mt-1">
-                  Your Garmin session has expired. Please re-authenticate by pasting fresh tokens below.
+                  Your intervals.icu API key is no longer valid. Generate a new one and paste it below.
                 </p>
               </div>
             )}
-            <button onClick={() => setShowTokenHelp(!showTokenHelp)}
+            <button onClick={() => setShowApiKeyHelp(!showApiKeyHelp)}
               className="text-slate-400 text-xs hover:text-slate-300 transition-colors flex items-center gap-1">
-              <span>{showTokenHelp ? '\u25BC' : '\u25B6'}</span>
-              How to get your Garmin cookies
+              <span>{showApiKeyHelp ? '\u25BC' : '\u25B6'}</span>
+              How to get your intervals.icu API key
             </button>
-            {showTokenHelp && (
+            {showApiKeyHelp && (
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3 text-[11px] text-slate-400 space-y-2">
-                <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">connect.garmin.com</span> in your browser</p>
-                <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Network tab</p>
-                <p><span className="text-white font-medium">3.</span> Click any request to connect.garmin.com</p>
-                <p><span className="text-white font-medium">4.</span> In the Headers tab, find <span className="text-emerald-400">cookie:</span> under Request Headers</p>
-                <p><span className="text-white font-medium">5.</span> Right-click the cookie value &gt; Copy value</p>
+                <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">intervals.icu</span></p>
+                <p><span className="text-white font-medium">2.</span> Click your avatar &gt; <span className="text-emerald-400">Settings</span></p>
+                <p><span className="text-white font-medium">3.</span> Scroll to the bottom &gt; <span className="text-emerald-400">Developer Settings</span></p>
+                <p><span className="text-white font-medium">4.</span> Accept the API terms, then click <span className="text-emerald-400">API Key</span> to reveal your key</p>
+                <p><span className="text-white font-medium">5.</span> Copy and paste it below</p>
               </div>
             )}
             <div>
-              <label className="text-[10px] text-slate-500 block mb-1">Cookie Header</label>
-              <textarea placeholder="Paste the full cookie header value from DevTools..." value={garminCookieHeader}
-                onChange={e => setGarminCookieHeader(e.target.value)}
-                rows={4}
+              <label className="text-[10px] text-slate-500 block mb-1">API Key</label>
+              <input type="password" placeholder="e.g. 1l0nlqjq3j1obdhg08rz5rfhx" value={apiKey}
+                onChange={e => setApiKey(e.target.value)}
+                autoComplete="off"
                 className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm font-mono
-                           placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors resize-none" />
+                           placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors" />
             </div>
-            {garminError && <p className="text-rose-400 text-xs">{garminError}</p>}
-            <button onClick={handleGarminConnect}
-              disabled={garminLoading || !garminCookieHeader}
+            {intervalsError && <p className="text-rose-400 text-xs">{intervalsError}</p>}
+            <button onClick={handleIntervalsConnect}
+              disabled={intervalsLoading || !apiKey}
               className="w-full py-3 rounded-xl text-sm font-medium bg-emerald-600 text-white
                          hover:bg-emerald-500 disabled:opacity-50 transition-colors min-h-[44px]">
-              {garminLoading ? 'Validating session...' : needsReauth ? 'Re-authenticate' : 'Connect Garmin'}
+              {intervalsLoading ? 'Validating key...' : needsReauth ? 'Re-authenticate' : 'Connect intervals.icu'}
             </button>
             <p className="text-[10px] text-slate-600 text-center">
-              Cookie data is encrypted with AES-256 and never exposed to the client.
+              Your API key is encrypted with AES-256 and never exposed to the client.
             </p>
           </div>
         )}

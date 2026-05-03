@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { doc, setDoc } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
-import { useGarminSync } from '@/hooks/useGarminData';
+import { useIntervalsSync } from '@/hooks/useIntervalsData';
 
 const GOALS = [
   { value: 'build_ftp', label: 'Build FTP / Power' },
@@ -25,7 +25,7 @@ const DAY_LABELS = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri',
 
 export default function OnboardingPage() {
   const { user, setUserSettings } = useAuth();
-  const { connectGarmin } = useGarminSync();
+  const { connectIntervals } = useIntervalsSync();
   const navigate = useNavigate();
 
   const [step, setStep] = useState(0);
@@ -50,18 +50,18 @@ export default function OnboardingPage() {
   const [totalHours, setTotalHours] = useState(9);
   const [restDays, setRestDays] = useState(['thu']);
 
-  // Step 5: Garmin (browser cookie capture)
-  const [garminCookieHeader, setGarminCookieHeader] = useState('');
-  const [garminLoading, setGarminLoading] = useState(false);
-  const [garminError, setGarminError] = useState('');
-  const [garminConnected, setGarminConnected] = useState(false);
+  // Step 5: intervals.icu API key
+  const [apiKey, setApiKey] = useState('');
+  const [intervalsLoading, setIntervalsLoading] = useState(false);
+  const [intervalsError, setIntervalsError] = useState('');
+  const [intervalsConnected, setIntervalsConnected] = useState(false);
 
   const steps = [
     { title: 'About You', icon: '\uD83D\uDC4B' },
     { title: 'Health', icon: '\uD83C\uDFCB\uFE0F' },
     { title: 'Goals', icon: '\uD83C\uDFAF' },
     { title: 'Schedule', icon: '\uD83D\uDCC5' },
-    { title: 'Garmin', icon: '\u231A' },
+    { title: 'intervals.icu', icon: '\u231A' },
   ];
 
   function toggleSecondaryGoal(goal) {
@@ -76,17 +76,17 @@ export default function OnboardingPage() {
     );
   }
 
-  async function handleGarminConnect(e) {
+  async function handleIntervalsConnect(e) {
     e.preventDefault();
-    setGarminLoading(true);
-    setGarminError('');
+    setIntervalsLoading(true);
+    setIntervalsError('');
     try {
-      await connectGarmin(garminCookieHeader);
-      setGarminConnected(true);
+      await connectIntervals(apiKey.trim());
+      setIntervalsConnected(true);
     } catch (err) {
-      setGarminError(err?.details?.message || err?.message?.replace(/^.*?:\s*/, '') || 'Token validation failed.');
+      setIntervalsError(err?.details?.message || err?.message?.replace(/^.*?:\s*/, '') || 'API key validation failed.');
     } finally {
-      setGarminLoading(false);
+      setIntervalsLoading(false);
     }
   }
 
@@ -148,7 +148,7 @@ export default function OnboardingPage() {
       case 1: return !!fitnessLevel;
       case 2: return !!primaryGoal;
       case 3: return totalHours >= 1;
-      case 4: return true; // Garmin is optional
+      case 4: return true; // intervals.icu is optional
       default: return true;
     }
   }
@@ -367,51 +367,52 @@ export default function OnboardingPage() {
           </div>
         )}
 
-        {/* Step 4: Garmin */}
+        {/* Step 4: intervals.icu */}
         {step === 4 && (
           <div className="space-y-4 mt-6">
-            {garminConnected ? (
+            {intervalsConnected ? (
               <div className="glass-card p-6 text-center">
                 <div className="w-12 h-12 rounded-full bg-emerald-500/20 flex items-center justify-center mx-auto mb-3">
                   <span className="text-emerald-400 text-xl">{'\u2713'}</span>
                 </div>
-                <p className="text-emerald-400 font-medium">Garmin Connected</p>
+                <p className="text-emerald-400 font-medium">intervals.icu Connected</p>
                 <p className="text-slate-400 text-xs mt-1">Your data will start syncing shortly.</p>
               </div>
             ) : (
               <>
                 <p className="text-slate-400 text-sm">
-                  Connect your Garmin to automatically sync heart rate, sleep, HRV, activities, and more.
+                  Connect intervals.icu to sync activities and wellness from your Garmin and Hammerhead Karoo.
                 </p>
                 <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3 text-[11px] text-slate-400 space-y-1.5">
-                  <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">connect.garmin.com</span> in your browser</p>
-                  <p><span className="text-white font-medium">2.</span> Open DevTools (F12) &gt; Network tab, click any request</p>
-                  <p><span className="text-white font-medium">3.</span> Copy the full <span className="text-emerald-400">cookie:</span> value from Request Headers</p>
+                  <p><span className="text-white font-medium">1.</span> Log into <span className="text-emerald-400">intervals.icu</span></p>
+                  <p><span className="text-white font-medium">2.</span> Click your avatar &gt; <span className="text-emerald-400">Settings</span></p>
+                  <p><span className="text-white font-medium">3.</span> Scroll down to <span className="text-emerald-400">Developer Settings</span> and copy your API key</p>
                 </div>
-                <form onSubmit={handleGarminConnect} className="space-y-3">
+                <form onSubmit={handleIntervalsConnect} className="space-y-3">
                   <div>
-                    <label className="text-[10px] text-slate-500 block mb-1">Cookie Header</label>
-                    <textarea
-                      placeholder="Paste the full cookie header value from DevTools..."
-                      value={garminCookieHeader}
-                      onChange={(e) => setGarminCookieHeader(e.target.value)}
-                      disabled={garminLoading}
-                      rows={4}
-                      className="input-field w-full font-mono resize-none"
+                    <label className="text-[10px] text-slate-500 block mb-1">API Key</label>
+                    <input
+                      type="password"
+                      placeholder="e.g. 1l0nlqjq3j1obdhg08rz5rfhx"
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      disabled={intervalsLoading}
+                      autoComplete="off"
+                      className="input-field w-full font-mono"
                     />
                   </div>
-                  {garminError && <p className="text-rose-400 text-xs">{garminError}</p>}
+                  {intervalsError && <p className="text-rose-400 text-xs">{intervalsError}</p>}
                   <button
                     type="submit"
-                    disabled={garminLoading || !garminCookieHeader}
+                    disabled={intervalsLoading || !apiKey}
                     className="btn-cta-sm w-full disabled:opacity-50 flex items-center justify-center gap-2"
                   >
-                    {garminLoading && <div className="w-4 h-4 rounded-full border-2 border-midnight border-t-transparent animate-spin" />}
-                    {garminLoading ? 'Validating session...' : 'Connect Garmin'}
+                    {intervalsLoading && <div className="w-4 h-4 rounded-full border-2 border-midnight border-t-transparent animate-spin" />}
+                    {intervalsLoading ? 'Validating key...' : 'Connect intervals.icu'}
                   </button>
                 </form>
                 <p className="text-slate-600 text-[10px] text-center">
-                  Cookie data is encrypted with AES-256. You can skip this and connect later in Settings.
+                  Your API key is encrypted with AES-256. You can skip this and connect later in Settings.
                 </p>
               </>
             )}

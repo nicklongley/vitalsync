@@ -43,7 +43,7 @@ export default function LoginPage() {
       {/* Sign-in card */}
       <div className="glass-card p-8 w-full max-w-sm text-center">
         <p className="text-slate-300 text-sm mb-6">
-          Sign in to connect your Garmin, track your health, and get AI-powered training insights.
+          Sign in to connect intervals.icu, track your health, and get AI-powered training insights.
         </p>
 
         <button

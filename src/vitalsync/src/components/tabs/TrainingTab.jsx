@@ -188,7 +188,7 @@ export default function TrainingTab() {
           <p className="text-3xl">{"\uD83C\uDFCB\uFE0F"}</p>
           <p className="text-sm text-slate-300 font-medium">No training plan yet</p>
           <p className="text-xs text-slate-500">
-            Generate an AI-powered weekly training plan based on your Garmin data, goals, and availability.
+            Generate an AI-powered weekly training plan based on your intervals.icu data, goals, and availability.
           </p>
           <button
             onClick={generatePlan}

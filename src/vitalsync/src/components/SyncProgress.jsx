@@ -1,4 +1,4 @@
-export default function GarminSyncProgress({ progress = 0 }) {
+export default function SyncProgress({ progress = 0 }) {
   const isComplete = progress >= 100;
 
   return (
@@ -8,16 +8,16 @@ export default function GarminSyncProgress({ progress = 0 }) {
           <div className="w-8 h-8 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin flex-shrink-0" />
         ) : (
           <div className="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center flex-shrink-0 text-midnight font-bold text-sm">
-            {"\u2713"}
+            {"✓"}
           </div>
         )}
         <div className="flex-1 min-w-0">
           <p className="text-sm text-white font-medium">
-            {!isComplete ? 'Syncing your Garmin history...' : 'History sync complete!'}
+            {!isComplete ? 'Syncing your training history...' : 'History sync complete!'}
           </p>
           <p className="text-xs text-slate-400">
             {!isComplete
-              ? 'Pulling your health data and activities'
+              ? 'Pulling activities and wellness from intervals.icu'
               : 'Your dashboard is ready with all your historical data'}
           </p>
         </div>

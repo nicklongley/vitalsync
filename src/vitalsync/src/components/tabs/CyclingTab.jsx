@@ -10,7 +10,7 @@ import {
   ComposedChart, Line, ReferenceLine,
   XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from 'recharts';
-import { useRecentActivities, useGarminSync } from '@/hooks/useGarminData';
+import { useRecentActivities, useIntervalsSync } from '@/hooks/useIntervalsData';
 import {
   GaugeRing, MetricCard, ActionPrompt, PowerZoneBar,
   cogganMaleTable, cogganFemaleTable, cogganPowerProfileMale,
@@ -18,7 +18,7 @@ import {
 } from '@/components/shared';
 import { useAuth } from '@/contexts/AuthContext';
 
-// ── Cycling type keys from Garmin ──
+// ── Cycling type keys ──
 const CYCLING_TYPES = [
   'cycling', 'road_biking', 'indoor_cycling', 'virtual_ride',
   'mountain_biking', 'gravel_cycling', 'recumbent_cycling', 'track_cycling',
@@ -36,7 +36,7 @@ const VIEWS = [
 export default function CyclingTab() {
   const [view, setView] = useState('overview');
   const { activities, loading } = useRecentActivities(100);
-  const { connected, syncing, syncNow, lastSyncAt } = useGarminSync();
+  const { connected, syncing, syncNow, lastSyncAt } = useIntervalsSync();
   const { userSettings } = useAuth();
 
   // Filter cycling activities
@@ -58,14 +58,14 @@ export default function CyclingTab() {
     );
   }
 
-  // No Garmin connected
+  // No intervals.icu connected
   if (!connected && rides.length === 0) {
     return (
       <div className="space-y-4">
         <ActionPrompt
           icon={"\uD83D\uDEB4"}
-          title="Connect Garmin for cycling analytics"
-          subtitle="Link your Garmin account to unlock FTP tracking, power zones, performance charts, and ride analysis."
+          title="Connect intervals.icu for cycling analytics"
+          subtitle="Link your intervals.icu account (which syncs your Hammerhead and Garmin rides) to unlock FTP tracking, power zones, and ride analysis."
           cta="Go to Settings"
           accent="cyan"
           dismissible={false}
@@ -81,7 +81,7 @@ export default function CyclingTab() {
         <ActionPrompt
           icon={"\uD83D\uDEB4"}
           title="No cycling data yet"
-          subtitle="Cycling analytics will appear once you sync rides with power data from your Garmin device."
+          subtitle="Cycling analytics will appear once your rides with power data sync through intervals.icu."
           cta="Sync Now"
           ctaAction={syncNow}
           accent="cyan"
@@ -98,7 +98,7 @@ export default function CyclingTab() {
         <div>
           <h2 className="text-lg font-bold text-white">Cycling</h2>
           <p className="text-[10px] text-slate-500">
-            {lastSyncAt ? `Synced ${formatTimeAgo(lastSyncAt)}` : 'Garmin connected'}
+            {lastSyncAt ? `Synced ${formatTimeAgo(lastSyncAt)}` : 'intervals.icu connected'}
           </p>
         </div>
         {connected && (
@@ -421,7 +421,7 @@ function RidesView({ rides }) {
       <ActionPrompt
         icon={"\uD83D\uDEB4"}
         title="No cycling rides found"
-        subtitle="Sync your Garmin to see detailed ride analysis with power, heart rate, and more."
+        subtitle="Sync from intervals.icu to see detailed ride analysis with power, heart rate, and more."
         cta="Sync Now"
         accent="cyan"
         dismissible={false}

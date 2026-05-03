@@ -1,20 +1,24 @@
 // ══════════════════════════════════════════════════════
-// VITALSYNC — Garmin Data Hook
-// Real-time Firestore listeners for Garmin health data
+// VITALSYNC — intervals.icu Data Hook
+// Real-time Firestore listeners + sync controls
+// Reads from wellnessDaily (intervals.icu); falls back to
+// historical garminDailies docs when no intervals data exists.
 // ══════════════════════════════════════════════════════
 
 import { useState, useEffect } from 'react';
 import {
   doc, collection, query, orderBy, limit, onSnapshot,
-  where,
+  where, getDoc,
 } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
 import { format, subDays } from 'date-fns';
 
-// ── Today's Garmin data (real-time) ──
-export function useGarminToday() {
+// ── Today's wellness (real-time) ──
+// Listens to wellnessDaily; if missing, attempts a one-shot read of
+// garminDailies for backwards-compatible display of historical data.
+export function useTodayWellness() {
   const { user } = useAuth();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -22,13 +26,23 @@ export function useGarminToday() {
   useEffect(() => {
     if (!user) return;
     const today = format(new Date(), 'yyyy-MM-dd');
-    const ref = doc(db, 'users', user.uid, 'garminDailies', today);
+    const wellnessRef = doc(db, 'users', user.uid, 'wellnessDaily', today);
 
-    const unsubscribe = onSnapshot(ref, (snap) => {
-      setData(snap.exists() ? snap.data() : null);
+    const unsubscribe = onSnapshot(wellnessRef, async (snap) => {
+      if (snap.exists()) {
+        setData(snap.data());
+      } else {
+        // Fall back to historical Garmin doc
+        try {
+          const garminSnap = await getDoc(doc(db, 'users', user.uid, 'garminDailies', today));
+          setData(garminSnap.exists() ? garminSnap.data() : null);
+        } catch {
+          setData(null);
+        }
+      }
       setLoading(false);
     }, (err) => {
-      console.error('Error listening to garminDailies:', err);
+      console.error('Error listening to wellnessDaily:', err);
       setLoading(false);
     });
 
@@ -38,8 +52,10 @@ export function useGarminToday() {
   return { data, loading };
 }
 
-// ── Week of Garmin data ──
-export function useGarminWeek() {
+// ── Week of wellness data ──
+// Listens to 7 days of wellnessDaily; merges in historical garminDailies
+// for any missing days so charts stay populated during transition.
+export function useWeekWellness() {
   const { user } = useAuth();
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -52,22 +68,33 @@ export function useGarminWeek() {
       days.push(format(subDays(new Date(), i), 'yyyy-MM-dd'));
     }
 
-    // Set up real-time listeners for each day
     const unsubs = days.map((dateStr, idx) => {
-      const ref = doc(db, 'users', user.uid, 'garminDailies', dateStr);
-      return onSnapshot(ref, (snap) => {
+      const ref = doc(db, 'users', user.uid, 'wellnessDaily', dateStr);
+      return onSnapshot(ref, async (snap) => {
+        let entry;
+        if (snap.exists()) {
+          entry = { date: dateStr, ...snap.data() };
+        } else {
+          try {
+            const garminSnap = await getDoc(doc(db, 'users', user.uid, 'garminDailies', dateStr));
+            entry = garminSnap.exists()
+              ? { date: dateStr, ...garminSnap.data(), _legacyGarmin: true }
+              : { date: dateStr };
+          } catch {
+            entry = { date: dateStr };
+          }
+        }
         setData((prev) => {
           const next = [...prev];
-          next[idx] = snap.exists() ? { date: dateStr, ...snap.data() } : { date: dateStr };
+          next[idx] = entry;
           return next;
         });
         setLoading(false);
       }, (err) => {
-        console.error(`Error listening to garminDailies/${dateStr}:`, err);
+        console.error(`Error listening to wellnessDaily/${dateStr}:`, err);
       });
     });
 
-    // Initialize with empty entries
     setData(days.map((dateStr) => ({ date: dateStr })));
 
     return () => unsubs.forEach((unsub) => unsub());
@@ -105,58 +132,54 @@ export function useRecentActivities(count = 10) {
   return { activities, loading };
 }
 
-// ── Garmin sync status (real-time) ──
-export function useGarminSync() {
+// ── intervals.icu sync status + controls (real-time) ──
+export function useIntervalsSync() {
   const { user, userSettings } = useAuth();
   const [syncing, setSyncing] = useState(false);
 
-  const garmin = userSettings?.garmin || {};
-  const connected = garmin.connected || false;
-  const needsReauth = garmin.needs_reauth || false;
-  const backfillStatus = garmin.backfillStatus || 'idle';
-  const backfillProgress = garmin.backfillProgress || 0;
-  const lastSyncAt = garmin.last_sync_at?.toDate?.() || garmin.lastSyncAt?.toDate?.() || null;
+  const intervals = userSettings?.intervals || {};
+  const connected = intervals.connected || false;
+  const needsReauth = intervals.needs_reauth || false;
+  const backfillStatus = intervals.backfillStatus || 'idle';
+  const backfillProgress = intervals.backfillProgress || 0;
+  const lastSyncAt = intervals.last_sync_at?.toDate?.() || null;
+  const displayName = intervals.displayName || '';
 
-  // Trigger on-demand sync
   async function syncNow() {
     if (!user || !connected || syncing) return;
     setSyncing(true);
     try {
-      const garminSyncFn = httpsCallable(functions, 'garmin_sync_on_demand');
-      await garminSyncFn();
+      const fn = httpsCallable(functions, 'intervals_sync_on_demand');
+      await fn();
     } catch (err) {
-      console.error('Garmin sync failed:', err);
+      console.error('intervals.icu sync failed:', err);
     } finally {
       setSyncing(false);
     }
   }
 
-  // Connect Garmin account via browser cookie header capture
-  async function connectGarmin(cookieHeader) {
+  async function connectIntervals(apiKey) {
     if (!user) throw new Error('Must be signed in');
-    const storeTokensFn = httpsCallable(functions, 'garmin_store_tokens');
-    return storeTokensFn({ cookie_header: cookieHeader });
+    const fn = httpsCallable(functions, 'intervals_set_api_key');
+    return fn({ api_key: apiKey });
   }
 
-  // Disconnect Garmin
-  async function disconnectGarmin() {
+  async function disconnectIntervals() {
     if (!user) throw new Error('Must be signed in');
-    const garminDisconnectFn = httpsCallable(functions, 'garmin_disconnect');
-    return garminDisconnectFn();
+    const fn = httpsCallable(functions, 'intervals_disconnect');
+    return fn();
   }
 
-  // Backfill all activity history
-  async function backfillActivities(startPage = 0) {
+  async function backfillHistory(days = 365) {
     if (!user || !connected) return null;
-    const backfillFn = httpsCallable(functions, 'garmin_backfill');
-    return backfillFn({ startPage });
+    const fn = httpsCallable(functions, 'intervals_backfill');
+    return fn({ days });
   }
 
-  // Compute activity stats on demand
   async function computeStats() {
     if (!user) return null;
-    const statsFn = httpsCallable(functions, 'compute_stats_on_demand');
-    return statsFn();
+    const fn = httpsCallable(functions, 'compute_stats_on_demand');
+    return fn();
   }
 
   return {
@@ -165,11 +188,12 @@ export function useGarminSync() {
     backfillStatus,
     backfillProgress,
     lastSyncAt,
+    displayName,
     syncing,
     syncNow,
-    connectGarmin,
-    disconnectGarmin,
-    backfillActivities,
+    connectIntervals,
+    disconnectIntervals,
+    backfillHistory,
     computeStats,
   };
 }
@@ -213,8 +237,8 @@ export function useHealthLog(type = null, count = 20) {
   return { entries, loading };
 }
 
-// ── Garmin weight history (extracted from garminDailies bodyComp) ──
-export function useGarminWeightHistory(days = 30) {
+// ── Weight history (intervals.icu wellness, with garminDailies fallback) ──
+export function useWeightHistory(days = 30) {
   const { user } = useAuth();
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -228,18 +252,30 @@ export function useGarminWeightHistory(days = 30) {
     }
 
     const unsubs = dateKeys.map((dateStr, idx) => {
-      const ref = doc(db, 'users', user.uid, 'garminDailies', dateStr);
-      return onSnapshot(ref, (snap) => {
-        setEntries((prev) => {
-          const next = [...prev];
-          if (snap.exists()) {
-            const bodyComp = snap.data()?.bodyComp || {};
-            const wList = bodyComp.dateWeightList;
+      const ref = doc(db, 'users', user.uid, 'wellnessDaily', dateStr);
+      return onSnapshot(ref, async (snap) => {
+        let result = null;
+        if (snap.exists()) {
+          const d = snap.data();
+          if (d?.weight) {
+            result = {
+              date: dateStr,
+              value: Math.round(d.weight * 10) / 10,
+              unit: 'kg',
+              bodyFat: d.bodyFat || null,
+              source: 'intervals',
+            };
+          }
+        } else {
+          // Fall back to historical Garmin bodyComp
+          try {
+            const garminSnap = await getDoc(doc(db, 'users', user.uid, 'garminDailies', dateStr));
+            const wList = garminSnap.exists() ? garminSnap.data()?.bodyComp?.dateWeightList : null;
             if (Array.isArray(wList) && wList.length > 0) {
               const latest = wList[wList.length - 1];
               const weightKg = latest?.weight ? Math.round(latest.weight / 100) / 10 : null;
               if (weightKg) {
-                next[idx] = {
+                result = {
                   date: dateStr,
                   value: weightKg,
                   unit: 'kg',
@@ -248,20 +284,18 @@ export function useGarminWeightHistory(days = 30) {
                   bmi: latest?.bmi || null,
                   source: 'garmin',
                 };
-              } else {
-                next[idx] = null;
               }
-            } else {
-              next[idx] = null;
             }
-          } else {
-            next[idx] = null;
-          }
+          } catch {}
+        }
+        setEntries((prev) => {
+          const next = [...prev];
+          next[idx] = result;
           return next;
         });
         setLoading(false);
       }, (err) => {
-        console.error(`Error listening to garminDailies/${dateStr} for weight:`, err);
+        console.error(`Error listening to wellnessDaily/${dateStr} for weight:`, err);
       });
     });
 
@@ -270,13 +304,11 @@ export function useGarminWeightHistory(days = 30) {
     return () => unsubs.forEach((unsub) => unsub());
   }, [user, days]);
 
-  // Filter out nulls and return only days with weight data
   const filtered = entries.filter(Boolean);
   return { entries: filtered, loading };
 }
 
 // ── Activity stats (aggregated periods) ──
-// Sport filtering is done client-side using the byType field
 export function useActivityStats(periodType = 'week', count = 52) {
   const { user } = useAuth();
   const [stats, setStats] = useState([]);

@@ -6,7 +6,7 @@
 
 import { useState, useMemo, useCallback } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
-import { useActivityStats, useGarminSync } from '@/hooks/useGarminData';
+import { useActivityStats, useIntervalsSync } from '@/hooks/useIntervalsData';
 import { ActionPrompt } from '@/components/shared';
 
 const PERIODS = ['week', 'month', 'year'];
@@ -123,7 +123,7 @@ export default function HistoryTab() {
 
   const count = period === 'week' ? 60 : period === 'month' ? 25 : 20;
   const { stats, loading } = useActivityStats(period, count);
-  const { connected, backfillActivities, computeStats } = useGarminSync();
+  const { connected, backfillHistory, computeStats } = useIntervalsSync();
 
   const handlePeriodChange = (p) => { setPeriod(p); setPeriodIndex(0); };
 
@@ -182,20 +182,13 @@ export default function HistoryTab() {
   const handleBackfill = useCallback(async () => {
     if (backfilling) return;
     setBackfilling(true);
-    setBackfillMsg('Loading activity history...');
+    setBackfillMsg('Loading 1 year of history from intervals.icu...');
     try {
-      let page = 0, totalActivities = 0, hasMore = true;
-      while (hasMore) {
-        const result = await backfillActivities(page);
-        const data = result?.data || {};
-        totalActivities += data.totalActivities || 0;
-        hasMore = data.hasMore || false;
-        page = data.nextPage || 0;
-        setBackfillMsg(`Loaded ${totalActivities} activities...`);
-      }
-      setBackfillMsg(`Computing stats for ${totalActivities} activities...`);
-      await computeStats();
-      setBackfillMsg(`Done! ${totalActivities} activities synced.`);
+      const result = await backfillHistory(365);
+      const data = result?.data || {};
+      const totalActivities = data.totalActivities || 0;
+      const totalWellness = data.totalWellness || 0;
+      setBackfillMsg(`Done! ${totalActivities} activities and ${totalWellness} wellness days synced.`);
     } catch (err) {
       console.error('Backfill failed:', err);
       setBackfillMsg('Backfill failed. Please try again.');
@@ -203,7 +196,7 @@ export default function HistoryTab() {
       setBackfilling(false);
       setTimeout(() => setBackfillMsg(''), 5000);
     }
-  }, [backfilling, backfillActivities, computeStats]);
+  }, [backfilling, backfillHistory]);
 
   const hasStats = stats.length > 0;
   const sportLabel = SPORTS.find(s => s.id === sport)?.label || sport;
@@ -279,8 +272,8 @@ export default function HistoryTab() {
       {!connected && !loading && (
         <ActionPrompt
           icon={"\u231A"}
-          title="Connect your Garmin"
-          subtitle="Link your Garmin account in Settings to see your training history, stats, and year-over-year comparisons."
+          title="Connect intervals.icu"
+          subtitle="Link your intervals.icu account in Settings to see your training history, stats, and year-over-year comparisons."
           cta="Go to Settings"
           accent="amber"
           dismissible={false}
@@ -292,7 +285,7 @@ export default function HistoryTab() {
         <ActionPrompt
           icon={"\uD83D\uDCCA"}
           title="No activity stats yet"
-          subtitle="Load your full Garmin activity history to see weekly, monthly, and yearly training stats."
+          subtitle="Load 1 year of activity history from intervals.icu to see weekly, monthly, and yearly training stats."
           cta="Load History"
           ctaAction={handleBackfill}
           accent="emerald"

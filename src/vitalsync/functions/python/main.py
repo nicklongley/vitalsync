@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════
 # VITALSYNC — Cloud Functions (Python)
-# Garmin sync via browser token capture + Claude AI analysis
+# intervals.icu sync (wellness + activities) + Claude AI analysis
 # ══════════════════════════════════════════════════════
 
 import json
@@ -23,7 +23,9 @@ db = firestore.client()
 REGION = options.SupportedRegion.EUROPE_WEST2
 
 # ── Secrets ──
-GARMIN_KEY_SECRET = options.SecretParam('GARMIN_ENCRYPTION_KEY')
+# Reuses the existing GARMIN_ENCRYPTION_KEY secret to avoid manual rotation.
+# Now used to encrypt the user's intervals.icu API key at rest.
+ENCRYPTION_KEY_SECRET = options.SecretParam('GARMIN_ENCRYPTION_KEY')
 
 
 # ══════════════════════════════════════════════════════
@@ -31,7 +33,6 @@ GARMIN_KEY_SECRET = options.SecretParam('GARMIN_ENCRYPTION_KEY')
 # ══════════════════════════════════════════════════════
 
 def _get_encryption_key() -> bytes:
-    """Load AES-256 key from environment (set via Secret Manager)."""
     key_hex = os.environ.get('GARMIN_ENCRYPTION_KEY', '')
     if not key_hex:
         raise ValueError('GARMIN_ENCRYPTION_KEY not set — configure via Secret Manager')
@@ -39,7 +40,6 @@ def _get_encryption_key() -> bytes:
 
 
 def encrypt(plaintext: str) -> str:
-    """AES-256-GCM encrypt → base64 string."""
     nonce = os.urandom(12)
     aesgcm = AESGCM(_get_encryption_key())
     ct = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), None)
@@ -47,7 +47,6 @@ def encrypt(plaintext: str) -> str:
 
 
 def decrypt(ciphertext: str) -> str:
-    """base64 string → AES-256-GCM decrypt."""
     raw = base64.b64decode(ciphertext)
     nonce, ct = raw[:12], raw[12:]
     aesgcm = AESGCM(_get_encryption_key())
@@ -55,106 +54,72 @@ def decrypt(ciphertext: str) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# GARMIN CONNECT WEB API — ENDPOINTS & HELPERS
+# INTERVALS.ICU CLIENT
 # ══════════════════════════════════════════════════════
 
-GARMIN_BASE_URL = "https://connect.garmin.com"
-
-ENDPOINTS = {
-    "stats":              "gc-api/usersummary-service/usersummary/daily/{guid}?calendarDate={date}",
-    "heart_rates":        "gc-api/wellness-service/wellness/dailyHeartRate/{guid}?date={date}",
-    "sleep":              "gc-api/wellness-service/wellness/dailySleepData/{guid}?date={date}&nonSleepBufferMinutes=60",
-    "stress":             "gc-api/wellness-service/wellness/dailyStress/{date}",
-    "body_comp":          "gc-api/weight-service/weight/dateRange?startDate={date}&endDate={date}",
-    "hrv":                "gc-api/hrv-service/hrv/{date}",
-    "spo2":               "gc-api/wellness-service/wellness/dailySpo2/{date}",
-    "respiration":        "gc-api/wellness-service/wellness/dailyRespiration?date={date}",
-    "training_readiness": "gc-api/metrics-service/metrics/trainingreadiness/{date}",
-    "training_status":    "gc-api/metrics-service/metrics/trainingstatus/aggregated/{date}",
-    "activities":         "gc-api/activitylist-service/activities/search/activities?start={start}&limit={limit}",
-    "body_battery":       "gc-api/wellness-service/wellness/bodyBattery/dates/{date}?startDate={date}&endDate={date}",
-    "user_profile":       "gc-api/userprofile-service/userprofile/user-settings/",
-}
+INTERVALS_BASE_URL = "https://intervals.icu/api/v1"
 
 
-def _restore_tokens(uid: str) -> dict:
-    """Restore Garmin tokens from encrypted Firestore storage."""
-    settings = db.document(f'users/{uid}').get().to_dict()
-    garmin_cfg = settings.get('garmin', {})
-
-    if not garmin_cfg.get('connected'):
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
-            message='Garmin not connected',
-        )
-
-    if garmin_cfg.get('needs_reauth'):
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
-            message='Garmin session expired — please re-authenticate in Settings',
-        )
-
-    encrypted = garmin_cfg.get('encrypted_tokens')
-    if not encrypted:
-        # Legacy user with old garthSession — flag for re-auth
-        if garmin_cfg.get('garthSession'):
-            db.document(f'users/{uid}').set({
-                'garmin': {'needs_reauth': True}
-            }, merge=True)
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
-            message='Garmin session expired — please re-authenticate in Settings',
-        )
-
-    tokens = json.loads(decrypt(encrypted))
-    tokens['user_guid'] = garmin_cfg.get('user_guid', '')
-    return tokens
+class IntervalsAuthError(Exception):
+    pass
 
 
-def _garmin_request(tokens: dict, endpoint: str, default=None):
-    """Make an authenticated GET request to the Garmin Connect web API."""
-    url = f"{GARMIN_BASE_URL}/{endpoint}"
-    headers = {
-        "Cookie": tokens['cookie_header'],
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    }
+def _intervals_request(api_key: str, path: str, params: dict = None, default=None):
+    """GET request to intervals.icu with HTTP Basic auth (username 'API_KEY')."""
+    url = f"{INTERVALS_BASE_URL}{path}"
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        if resp.status_code in (401, 403):
-            print(f'Garmin API auth failed ({resp.status_code}) for {endpoint}')
+        resp = requests.get(
+            url,
+            auth=('API_KEY', api_key),
+            params=params or {},
+            timeout=30,
+            headers={'Accept': 'application/json'},
+        )
+        if resp.status_code == 401:
+            raise IntervalsAuthError('Invalid API key')
+        if resp.status_code == 429:
+            print(f'intervals.icu rate-limited for {path} — backing off')
+            time.sleep(2)
             return default
         if resp.status_code == 204 or not resp.content:
             return default
         resp.raise_for_status()
         return resp.json()
+    except IntervalsAuthError:
+        raise
     except Exception as e:
-        print(f'Garmin API call failed for {endpoint}: {e}')
+        print(f'intervals.icu request failed for {path}: {e}')
         return default
 
 
-def _save_tokens(uid: str, tokens: dict):
-    """Persist tokens and update sync timestamp in Firestore."""
-    token_data = {
-        'cookie_header': tokens['cookie_header'],
-    }
-    db.document(f'users/{uid}').set({
-        'garmin': {
-            'encrypted_tokens': encrypt(json.dumps(token_data)),
-            'last_sync_at': firestore.SERVER_TIMESTAMP,
-            'last_refresh_at': firestore.SERVER_TIMESTAMP,
-        }
-    }, merge=True)
+def _get_user_api_key(uid: str) -> str:
+    user = db.document(f'users/{uid}').get().to_dict() or {}
+    cfg = user.get('intervals', {})
+    if not cfg.get('connected'):
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            message='intervals.icu not connected',
+        )
+    if cfg.get('needs_reauth'):
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            message='intervals.icu API key invalid — please re-enter in Settings',
+        )
+    enc = cfg.get('encrypted_api_key')
+    if not enc:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            message='No API key stored',
+        )
+    return decrypt(enc)
 
+
+# ══════════════════════════════════════════════════════
+# FIRESTORE SANITISATION
+# ══════════════════════════════════════════════════════
 
 def _sanitize_for_firestore(data, max_depth=10):
-    """
-    Strip deeply nested or oversized data that Firestore rejects.
-    Firestore has a 20-level nesting limit and 1MB doc limit.
-    Also removes large arrays (e.g. per-minute stress values)
-    and converts unsupported types (datetime, etc.) to strings.
-    Handles NaN, Inf, bytes, and other non-Firestore types.
-    """
+    """Strip oversized arrays, fix unsupported types, cap nesting."""
     import math
 
     if max_depth <= 0:
@@ -199,303 +164,376 @@ def _sanitize_for_firestore(data, max_depth=10):
 
 
 # ══════════════════════════════════════════════════════
-# GARMIN LOGIN
+# ACTIVITY TYPE MAPPING (intervals.icu → Garmin typeKey)
+# Keeps the existing UI sport-icon and stats grouping working.
 # ══════════════════════════════════════════════════════
 
-@https_fn.on_call(region=REGION, memory=options.MemoryOption.GB_1, timeout_sec=540, secrets=[GARMIN_KEY_SECRET])
-def garmin_store_tokens(req: https_fn.CallableRequest) -> dict:
-    """Store browser-captured Garmin JWT tokens and start initial sync."""
-    if not req.auth:
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-            message='Must be signed in',
+_TYPE_MAP = {
+    'Ride': 'cycling',
+    'VirtualRide': 'indoor_cycling',
+    'EBikeRide': 'cycling',
+    'GravelRide': 'gravel_cycling',
+    'MountainBikeRide': 'mountain_biking',
+    'Run': 'running',
+    'TrailRun': 'trail_running',
+    'TreadmillRun': 'treadmill_running',
+    'VirtualRun': 'treadmill_running',
+    'Swim': 'swimming',
+    'OpenWaterSwim': 'open_water_swimming',
+    'Walk': 'walking',
+    'Hike': 'hiking',
+    'WeightTraining': 'strength_training',
+    'Workout': 'strength_training',
+    'Yoga': 'yoga',
+    'Rowing': 'rowing',
+    'Kayaking': 'rowing',
+    'Elliptical': 'elliptical',
+    'StairStepper': 'stair_climbing',
+}
+
+
+def _map_intervals_activity(act: dict) -> dict:
+    """intervals.icu activity → Garmin-compatible schema for frontend."""
+    act_id = act.get('id')
+    raw_type = act.get('type', '') or ''
+    type_key = _TYPE_MAP.get(raw_type, raw_type.lower() or 'other')
+    joules = act.get('icu_joules') or 0
+    calories = int(joules / 4184) if joules else None
+    return {
+        'activityId': f'intervals_{act_id}',
+        'intervalsId': act_id,
+        'activityName': act.get('name'),
+        'description': act.get('description'),
+        'startTimeLocal': act.get('start_date_local'),
+        'startTimeGMT': act.get('start_date'),
+        'duration': act.get('elapsed_time'),
+        'movingDuration': act.get('moving_time'),
+        'distance': act.get('distance'),
+        'elevationGain': act.get('total_elevation_gain'),
+        'elevationLoss': act.get('total_elevation_loss'),
+        'calories': calories,
+        'averageHR': act.get('average_heartrate'),
+        'maxHR': act.get('max_heartrate'),
+        'averagePower': act.get('average_watts'),
+        'normalizedPower': act.get('icu_weighted_avg_watts'),
+        'maxPower': act.get('max_watts'),
+        'averageSpeed': act.get('average_speed'),
+        'maxSpeed': act.get('max_speed'),
+        'averageCadence': act.get('average_cadence'),
+        'trainingLoad': act.get('icu_training_load'),
+        'intensityFactor': act.get('icu_intensity'),
+        'tss': act.get('icu_training_load'),
+        'ftpAtTime': act.get('icu_ftp'),
+        'activityType': {'typeKey': type_key},
+        'rawType': raw_type,
+        'deviceName': act.get('device_name'),
+        'sourceClient': act.get('oauth_client_name'),
+        'sourceType': act.get('source'),
+        'externalId': act.get('external_id'),
+        'fileType': act.get('file_type'),
+        'source': 'intervals',
+    }
+
+
+# ══════════════════════════════════════════════════════
+# SYNC CORE
+# ══════════════════════════════════════════════════════
+
+def _resume_start_date(uid: str) -> str:
+    """Most recent date across wellnessDaily + garminDailies, else 30d ago."""
+    candidates = []
+    for coll in ('wellnessDaily', 'garminDailies'):
+        docs = list(
+            db.collection(f'users/{uid}/{coll}')
+            .order_by('__name__', direction='DESCENDING')
+            .limit(1)
+            .stream()
         )
-    uid = req.auth.uid
-
-    cookie_header = (req.data.get('cookie_header') or '').strip()
-    if not cookie_header:
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-            message='Cookie header is required',
-        )
-
-    tokens = {'cookie_header': cookie_header}
-
-    try:
-        # Validate tokens by fetching user profile
-        profile = _garmin_request(tokens, ENDPOINTS['user_profile'])
-        if not profile:
-            raise https_fn.HttpsError(
-                code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
-                message='Invalid tokens — could not reach Garmin API. Please check your tokens and try again.',
-            )
-
-        user_guid = str(profile.get('userProfileNumber', '') or '')
-        tokens['user_guid'] = user_guid
-        display_name = profile.get('displayName') or profile.get('userName') or ''
-
-        # Persist encrypted cookie header
-        db.document(f'users/{uid}').set({
-            'garmin': {
-                'connected': True,
-                'encrypted_tokens': encrypt(json.dumps({'cookie_header': cookie_header})),
-                'user_guid': user_guid,
-                'displayName': display_name,
-                'needs_reauth': False,
-                'token_captured_at': firestore.SERVER_TIMESTAMP,
-                'connectedAt': firestore.SERVER_TIMESTAMP,
-                'last_sync_at': None,
-                'last_refresh_at': None,
-                'backfillStatus': 'syncing',
-                'backfillProgress': 0,
-            }
-        }, merge=True)
-
-        # Kick off initial sync (first 30 days + today)
-        _do_sync(uid, tokens, backfill_days=30)
-        _save_tokens(uid, tokens)
-
-        # Mark initial backfill as complete (30 days done)
-        db.document(f'users/{uid}').set({
-            'garmin': {
-                'backfillStatus': 'complete',
-                'backfillProgress': 100,
-            }
-        }, merge=True)
-
-        return {'status': 'connected', 'displayName': display_name}
-
-    except https_fn.HttpsError:
-        raise
-    except Exception as e:
-        print(f'Garmin token store failed for {uid}: {e}')
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.INTERNAL,
-            message='Failed to connect Garmin. Please try again.',
-        )
+        if docs:
+            candidates.append(docs[0].id)
+    if candidates:
+        return max(candidates)
+    return (date.today() - timedelta(days=30)).isoformat()
 
 
-# ══════════════════════════════════════════════════════
-# GARMIN DISCONNECT
-# ══════════════════════════════════════════════════════
+def _do_intervals_sync(uid: str, api_key: str, start_date: str, end_date: str = None):
+    """Pull wellness + activities for a date range and upsert to Firestore."""
+    if not end_date:
+        end_date = date.today().isoformat()
 
-@https_fn.on_call(region=REGION, secrets=[GARMIN_KEY_SECRET])
-def garmin_disconnect(req: https_fn.CallableRequest) -> dict:
-    """Disconnect Garmin — remove tokens but keep historical data."""
-    if not req.auth:
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-            message='Must be signed in',
-        )
-    uid = req.auth.uid
+    print(f'intervals sync {uid}: {start_date} → {end_date}')
 
-    # Use dot-notation with update() for DELETE_FIELD to work correctly.
-    # set(merge=True) with nested dicts replaces the entire nested object,
-    # which prevents DELETE_FIELD from working as expected.
-    db.document(f'users/{uid}').update({
-        'garmin.connected': False,
-        'garmin.encrypted_tokens': firestore.DELETE_FIELD,
-        'garmin.user_guid': firestore.DELETE_FIELD,
-        'garmin.needs_reauth': firestore.DELETE_FIELD,
-        'garmin.token_captured_at': firestore.DELETE_FIELD,
-        'garmin.last_refresh_at': firestore.DELETE_FIELD,
-        'garmin.disconnectedAt': firestore.SERVER_TIMESTAMP,
-    })
+    # ── Wellness ──
+    wellness = _intervals_request(
+        api_key,
+        '/athlete/0/wellness',
+        params={'oldest': start_date, 'newest': end_date},
+        default=[],
+    ) or []
 
-    return {'status': 'disconnected'}
+    latest_weight = None
+    latest_body_fat = None
+    latest_weight_date = ''
 
-
-# ══════════════════════════════════════════════════════
-# GARMIN DATA SYNC — CORE PULL LOGIC
-# ══════════════════════════════════════════════════════
-
-def _do_sync(uid: str, tokens: dict, backfill_days: int = 1):
-    """
-    Pull Garmin data for the last N days and write to Firestore.
-    backfill_days=1 for daily sync, 30 for initial, 730 for full backfill.
-    Each daily document is written individually so one bad field
-    doesn't block the rest.
-    """
-    guid = tokens.get('user_guid', '')
-    today = date.today()
-    auth_failed = False
-
-    for i in range(backfill_days):
-        d = today - timedelta(days=i)
-        ds = d.isoformat()
-
-        # Fetch each data source individually via direct HTTP
-        data_sources = {
-            'stats': _garmin_request(tokens, ENDPOINTS['stats'].format(guid=guid, date=ds), default={}),
-            'heartRates': _garmin_request(tokens, ENDPOINTS['heart_rates'].format(guid=guid, date=ds), default={}),
-            'sleep': _garmin_request(tokens, ENDPOINTS['sleep'].format(guid=guid, date=ds), default={}),
-            'stress': _garmin_request(tokens, ENDPOINTS['stress'].format(date=ds), default={}),
-            'bodyBattery': _garmin_request(tokens, ENDPOINTS['body_battery'].format(date=ds), default=[]),
-            'bodyComp': _garmin_request(tokens, ENDPOINTS['body_comp'].format(date=ds), default={}),
-            'hrv': _garmin_request(tokens, ENDPOINTS['hrv'].format(date=ds), default={}),
-            'spo2': _garmin_request(tokens, ENDPOINTS['spo2'].format(date=ds), default={}),
-            'respiration': _garmin_request(tokens, ENDPOINTS['respiration'].format(date=ds), default={}),
-            'trainingReadiness': _garmin_request(tokens, ENDPOINTS['training_readiness'].format(date=ds), default={}),
-        }
-
-        # Check if most requests returned defaults (auth may have failed)
-        empty_count = sum(1 for v in data_sources.values() if v in ({}, []))
-        if empty_count >= 8 and i == 0:
-            # Almost everything empty on first day — likely auth failure
-            auth_failed = True
-
-        # Brief pause between days to avoid rate limiting
-        if i < backfill_days - 1:
-            time.sleep(0.3)
-
-        ref = db.document(f'users/{uid}/garminDailies/{ds}')
-
-        # Debug: log what we fetched
-        for fn, fd in data_sources.items():
-            keys = list(fd.keys())[:5] if isinstance(fd, dict) else 'N/A'
-            size = len(fd) if hasattr(fd, '__len__') else 0
-            print(f'  {ds}/{fn}: {size} keys, sample={keys}')
-
-        # Write each field individually so one bad field doesn't block others
-        base = {'date': ds, 'processedAt': firestore.SERVER_TIMESTAMP, 'source': 'garmin_pull'}
-        for field_name, field_data in data_sources.items():
-            try:
-                sanitized = _sanitize_for_firestore(field_data)
-                ref.set({**base, field_name: sanitized}, merge=True)
-            except Exception as e:
-                # If sanitization wasn't enough, force JSON round-trip to strip
-                # all non-serializable types, then retry
-                try:
-                    import json
-                    json_safe = json.loads(json.dumps(field_data, default=str))
-                    sanitized = _sanitize_for_firestore(json_safe)
-                    ref.set({**base, field_name: sanitized}, merge=True)
-                except Exception as e2:
-                    print(f'Failed to write {field_name} for {ds} (even after JSON round-trip): {e2}')
-                    # Last resort: skip this field entirely
-
-    # Extract latest weight from today's bodyComp and update profile
-    try:
-        today_ref = db.document(f'users/{uid}/garminDailies/{today.isoformat()}')
-        today_doc = today_ref.get()
-        if today_doc.exists:
-            body_comp = today_doc.to_dict().get('bodyComp', {})
-            weight_list = body_comp.get('dateWeightList', [])
-            if isinstance(weight_list, list) and weight_list:
-                latest = weight_list[-1] if isinstance(weight_list[-1], dict) else {}
-                weight_grams = latest.get('weight', 0)
-                if weight_grams and isinstance(weight_grams, (int, float)) and weight_grams > 0:
-                    weight_kg = round(weight_grams / 1000, 1)
-                    body_fat = latest.get('bodyFat', None)
-                    weight_update = {'weight': weight_kg, 'weightSource': 'garmin'}
-                    if body_fat and isinstance(body_fat, (int, float)) and 0 < body_fat < 100:
-                        weight_update['bodyFatPct'] = round(body_fat, 1)
-                    db.document(f'users/{uid}').set(
-                        {'profile': weight_update}, merge=True
-                    )
-                    print(f'Updated profile weight from Garmin: {weight_kg} kg')
-    except Exception as e:
-        print(f'Failed to extract weight from bodyComp: {e}')
-
-    # Flag for re-auth if auth appears to have failed
-    if auth_failed:
-        db.document(f'users/{uid}').set({
-            'garmin': {'needs_reauth': True}
-        }, merge=True)
-
-    # Sync recent activities (last 20)
-    activities = _garmin_request(tokens, ENDPOINTS['activities'].format(start=0, limit=20), default=[])
     batch = db.batch()
     write_count = 0
-    for act in (activities or []):
-        act_id = str(act.get('activityId', ''))
-        if act_id:
-            try:
-                ref = db.document(f'users/{uid}/activities/{act_id}')
-                clean_act = _sanitize_for_firestore(act)
-                clean_act['processedAt'] = firestore.SERVER_TIMESTAMP
-                clean_act['source'] = 'garmin_pull'
-                batch.set(ref, clean_act, merge=True)
-                write_count += 1
+    for entry in wellness:
+        date_id = entry.get('id') or entry.get('date')
+        if not date_id:
+            continue
+        # Track latest weight reading for profile update
+        w = entry.get('weight')
+        if w and isinstance(w, (int, float)) and w > 0 and date_id > latest_weight_date:
+            latest_weight = w
+            latest_body_fat = entry.get('bodyFat')
+            latest_weight_date = date_id
 
-                if write_count >= 450:
-                    batch.commit()
-                    batch = db.batch()
-                    write_count = 0
-            except Exception as e:
-                print(f'Failed to write activity {act_id}: {e}')
+        ref = db.document(f'users/{uid}/wellnessDaily/{date_id}')
+        clean = _sanitize_for_firestore(entry)
+        clean['source'] = 'intervals'
+        clean['processedAt'] = firestore.SERVER_TIMESTAMP
+        batch.set(ref, clean, merge=True)
+        write_count += 1
+        if write_count >= 450:
+            batch.commit()
+            batch = db.batch()
+            write_count = 0
+    if write_count > 0:
+        batch.commit()
+
+    if latest_weight:
+        weight_update = {'weight': round(latest_weight, 1), 'weightSource': 'intervals'}
+        if latest_body_fat and isinstance(latest_body_fat, (int, float)) and 0 < latest_body_fat < 100:
+            weight_update['bodyFatPct'] = round(latest_body_fat, 1)
+        try:
+            db.document(f'users/{uid}').set({'profile': weight_update}, merge=True)
+            print(f'Updated profile weight from intervals.icu: {weight_update["weight"]} kg')
+        except Exception as e:
+            print(f'Profile weight update failed: {e}')
+
+    # ── Activities ──
+    activities = _intervals_request(
+        api_key,
+        '/athlete/0/activities',
+        params={'oldest': start_date, 'newest': end_date},
+        default=[],
+    ) or []
+
+    batch = db.batch()
+    write_count = 0
+    for act in activities:
+        act_id = act.get('id')
+        if not act_id:
+            continue
+        try:
+            mapped = _map_intervals_activity(act)
+            ref = db.document(f'users/{uid}/activities/intervals_{act_id}')
+            clean = _sanitize_for_firestore(mapped)
+            clean['processedAt'] = firestore.SERVER_TIMESTAMP
+            batch.set(ref, clean, merge=True)
+            write_count += 1
+            if write_count >= 450:
+                batch.commit()
+                batch = db.batch()
+                write_count = 0
+        except Exception as e:
+            print(f'Failed to write activity intervals_{act_id}: {e}')
 
     if write_count > 0:
         batch.commit()
 
-
-# ══════════════════════════════════════════════════════
-# GARMIN SYNC — ON-DEMAND (user opens app)
-# ══════════════════════════════════════════════════════
-
-@https_fn.on_call(region=REGION, memory=options.MemoryOption.MB_512, secrets=[GARMIN_KEY_SECRET])
-def garmin_sync_on_demand(req: https_fn.CallableRequest) -> dict:
-    """Pull latest Garmin data when user opens the app."""
-    if not req.auth:
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-            message='Must be signed in',
-        )
-    uid = req.auth.uid
-
-    tokens = _restore_tokens(uid)
-    _do_sync(uid, tokens, backfill_days=2)  # Today + yesterday
-    _save_tokens(uid, tokens)
-
-    return {'status': 'ok', 'syncedAt': datetime.utcnow().isoformat()}
+    print(f'intervals sync done {uid}: {len(wellness)} wellness, {len(activities)} activities')
+    return {'wellness': len(wellness), 'activities': len(activities)}
 
 
 # ══════════════════════════════════════════════════════
-# GARMIN SYNC — SCHEDULED (every 15 minutes)
-# ══════════════════════════════════════════════════════
-
-@scheduler_fn.on_schedule(
-    schedule='every 15 minutes',
-    region=REGION,
-    memory=options.MemoryOption.MB_512,
-    timeout_sec=540,
-    secrets=[GARMIN_KEY_SECRET],
-)
-def garmin_scheduled_sync(event: scheduler_fn.ScheduledEvent) -> None:
-    """Sync all connected Garmin users every 15 minutes."""
-    # Query all users with garmin.connected == true
-    users_ref = db.collection('users').where(
-        filter=google.cloud.firestore.FieldFilter('garmin.connected', '==', True)
-    )
-
-    for user_doc in users_ref.stream():
-        uid = user_doc.id
-        try:
-            tokens = _restore_tokens(uid)
-            _do_sync(uid, tokens, backfill_days=1)
-            _save_tokens(uid, tokens)
-        except Exception as e:
-            print(f'Sync failed for {uid}: {e}')
-            # Don't fail the whole batch — continue to next user
-
-
-# ══════════════════════════════════════════════════════
-# GARMIN BACKFILL — DEEP HISTORY
+# CONNECT — store API key, validate, initial backfill
 # ══════════════════════════════════════════════════════
 
 @https_fn.on_call(
     region=REGION,
     memory=options.MemoryOption.GB_1,
     timeout_sec=540,
-    secrets=[GARMIN_KEY_SECRET],
+    secrets=[ENCRYPTION_KEY_SECRET],
 )
-def garmin_backfill(req: https_fn.CallableRequest) -> dict:
-    """
-    Pull full activity history from Garmin.
-    Paginates through all activities (up to 10,000) and writes to Firestore.
-    After activities are saved, computes weekly stats.
-    Supports chunked pagination via startPage parameter.
-    """
+def intervals_set_api_key(req: https_fn.CallableRequest) -> dict:
+    """Validate API key against intervals.icu and store encrypted; run initial sync."""
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    api_key = (req.data.get('api_key') or '').strip()
+    if not api_key:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='API key is required',
+        )
+
+    try:
+        profile = _intervals_request(api_key, '/athlete/0/profile')
+    except IntervalsAuthError:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='Invalid API key. Check it on intervals.icu Settings → Developer.',
+        )
+
+    if not profile:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAVAILABLE,
+            message='Could not reach intervals.icu — try again shortly.',
+        )
+
+    athlete = profile.get('athlete') or profile
+    display_name = athlete.get('name') or athlete.get('displayName') or athlete.get('firstname') or ''
+
+    db.document(f'users/{uid}').set({
+        'intervals': {
+            'connected': True,
+            'encrypted_api_key': encrypt(api_key),
+            'displayName': display_name,
+            'connectedAt': firestore.SERVER_TIMESTAMP,
+            'last_sync_at': None,
+            'needs_reauth': False,
+            'backfillStatus': 'syncing',
+            'backfillProgress': 0,
+        },
+    }, merge=True)
+
+    try:
+        start_date = _resume_start_date(uid)
+        _do_intervals_sync(uid, api_key, start_date=start_date)
+        db.document(f'users/{uid}').set({
+            'intervals': {
+                'backfillStatus': 'complete',
+                'backfillProgress': 100,
+                'last_sync_at': firestore.SERVER_TIMESTAMP,
+            },
+        }, merge=True)
+    except IntervalsAuthError:
+        db.document(f'users/{uid}').set({
+            'intervals': {'needs_reauth': True, 'backfillStatus': 'idle'},
+        }, merge=True)
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='API key rejected during sync.',
+        )
+    except Exception as e:
+        print(f'Initial intervals sync failed for {uid}: {e}')
+        db.document(f'users/{uid}').set({
+            'intervals': {'backfillStatus': 'idle'},
+        }, merge=True)
+
+    return {'status': 'connected', 'displayName': display_name}
+
+
+# ══════════════════════════════════════════════════════
+# DISCONNECT
+# ══════════════════════════════════════════════════════
+
+@https_fn.on_call(region=REGION)
+def intervals_disconnect(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    db.document(f'users/{uid}').update({
+        'intervals.connected': False,
+        'intervals.encrypted_api_key': firestore.DELETE_FIELD,
+        'intervals.needs_reauth': firestore.DELETE_FIELD,
+        'intervals.disconnectedAt': firestore.SERVER_TIMESTAMP,
+    })
+    return {'status': 'disconnected'}
+
+
+# ══════════════════════════════════════════════════════
+# SYNC — ON-DEMAND (user opens app)
+# ══════════════════════════════════════════════════════
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=300,
+    secrets=[ENCRYPTION_KEY_SECRET],
+)
+def intervals_sync_on_demand(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    api_key = _get_user_api_key(uid)
+    start = (date.today() - timedelta(days=2)).isoformat()
+    try:
+        result = _do_intervals_sync(uid, api_key, start_date=start)
+    except IntervalsAuthError:
+        db.document(f'users/{uid}').set({
+            'intervals': {'needs_reauth': True},
+        }, merge=True)
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='API key rejected — please re-enter in Settings.',
+        )
+
+    db.document(f'users/{uid}').set({
+        'intervals': {'last_sync_at': firestore.SERVER_TIMESTAMP},
+    }, merge=True)
+    return {'status': 'ok', 'syncedAt': datetime.utcnow().isoformat(), **result}
+
+
+# ══════════════════════════════════════════════════════
+# SYNC — SCHEDULED (every 30 minutes)
+# ══════════════════════════════════════════════════════
+
+@scheduler_fn.on_schedule(
+    schedule='every 30 minutes',
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=540,
+    secrets=[ENCRYPTION_KEY_SECRET],
+)
+def intervals_scheduled_sync(event: scheduler_fn.ScheduledEvent) -> None:
+    """Sync every connected intervals.icu user."""
+    users_ref = db.collection('users').where(
+        filter=google.cloud.firestore.FieldFilter('intervals.connected', '==', True)
+    )
+    start = (date.today() - timedelta(days=2)).isoformat()
+
+    for user_doc in users_ref.stream():
+        uid = user_doc.id
+        try:
+            api_key = _get_user_api_key(uid)
+            _do_intervals_sync(uid, api_key, start_date=start)
+            db.document(f'users/{uid}').set({
+                'intervals': {'last_sync_at': firestore.SERVER_TIMESTAMP},
+            }, merge=True)
+        except IntervalsAuthError:
+            db.document(f'users/{uid}').set({
+                'intervals': {'needs_reauth': True},
+            }, merge=True)
+        except Exception as e:
+            print(f'Scheduled sync failed for {uid}: {e}')
+
+
+# ══════════════════════════════════════════════════════
+# BACKFILL — extend history N days back
+# ══════════════════════════════════════════════════════
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.GB_1,
+    timeout_sec=540,
+    secrets=[ENCRYPTION_KEY_SECRET],
+)
+def intervals_backfill(req: https_fn.CallableRequest) -> dict:
+    """Pull `days` of history (default 365). Chunked to fit timeouts."""
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
@@ -504,92 +542,73 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
     uid = req.auth.uid
 
     try:
-        start_page = int(req.data.get('startPage', 0))
+        days = int(req.data.get('days', 365))
     except (ValueError, TypeError):
-        start_page = 0
+        days = 365
+    days = max(1, min(days, 3650))
 
-    PAGE_SIZE = 100
-    MAX_PAGES_PER_CALL = 50  # 5000 activities per invocation (within 9-min timeout)
-
-    tokens = _restore_tokens(uid)
-    print(f'Backfill started for {uid}, startPage={start_page}')
+    api_key = _get_user_api_key(uid)
 
     db.document(f'users/{uid}').set({
-        'garmin': {'backfillStatus': 'syncing'}
+        'intervals': {'backfillStatus': 'syncing', 'backfillProgress': 0},
     }, merge=True)
 
-    total_saved = 0
-    page = start_page
-    found_activities = True
+    today = date.today()
+    chunk_days = 60
+    total_w = 0
+    total_a = 0
+    chunks_total = (days + chunk_days - 1) // chunk_days
+    chunk_end = today
+    chunks_done = 0
 
-    while found_activities and page < start_page + MAX_PAGES_PER_CALL:
-        print(f'Fetching activities page {page} (offset={page * PAGE_SIZE}, limit={PAGE_SIZE})')
-        acts = _garmin_request(tokens, ENDPOINTS['activities'].format(start=page * PAGE_SIZE, limit=PAGE_SIZE), default=[])
-        print(f'Got {len(acts) if acts else 0} activities from page {page}')
-        if not acts:
-            found_activities = False
-            break
-
-        batch = db.batch()
-        batch_count = 0
-        for act in acts:
-            act_id = str(act.get('activityId', ''))
-            if act_id:
-                try:
-                    ref = db.document(f'users/{uid}/activities/{act_id}')
-                    clean_act = _sanitize_for_firestore(act)
-                    clean_act['processedAt'] = firestore.SERVER_TIMESTAMP
-                    clean_act['source'] = 'garmin_backfill'
-                    batch.set(ref, clean_act, merge=True)
-                    batch_count += 1
-                    if batch_count >= 450:
-                        batch.commit()
-                        batch = db.batch()
-                        batch_count = 0
-                except Exception as e:
-                    print(f'Failed to write activity {act_id}: {e}')
-
-        if batch_count > 0:
-            batch.commit()
-
-        total_saved += len(acts)
-        page += 1
-
-        # Update progress
-        db.document(f'users/{uid}').set({
-            'garmin': {
-                'backfillProgress': total_saved,
-                'backfillStatus': 'syncing',
-            }
-        }, merge=True)
-
-        # If we got fewer than PAGE_SIZE, we've reached the end
-        if len(acts) < PAGE_SIZE:
-            found_activities = False
-
-    _save_tokens(uid, tokens)
-
-    has_more = found_activities  # True if we hit the per-call page limit
-
-    if not has_more:
-        # All activities loaded — compute weekly stats and mark complete
+    while chunk_end > today - timedelta(days=days):
+        chunk_start = max(
+            chunk_end - timedelta(days=chunk_days - 1),
+            today - timedelta(days=days),
+        )
         try:
-            _compute_all_stats(uid)
+            result = _do_intervals_sync(
+                uid, api_key,
+                start_date=chunk_start.isoformat(),
+                end_date=chunk_end.isoformat(),
+            )
+            total_w += result.get('wellness', 0)
+            total_a += result.get('activities', 0)
+        except IntervalsAuthError:
+            db.document(f'users/{uid}').set({
+                'intervals': {'needs_reauth': True, 'backfillStatus': 'idle'},
+            }, merge=True)
+            raise https_fn.HttpsError(
+                code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+                message='API key rejected during backfill.',
+            )
         except Exception as e:
-            print(f'Stats computation failed after backfill for {uid}: {e}')
+            print(f'Backfill chunk failed for {uid} ({chunk_start}→{chunk_end}): {e}')
 
+        chunks_done += 1
+        progress = min(100, int(chunks_done / chunks_total * 100))
         db.document(f'users/{uid}').set({
-            'garmin': {
-                'backfillStatus': 'complete',
-                'backfillProgress': 100,
-            }
+            'intervals': {'backfillProgress': progress},
         }, merge=True)
+        chunk_end = chunk_start - timedelta(days=1)
+
+    try:
+        _compute_all_stats(uid)
+    except Exception as e:
+        print(f'Stats computation after backfill failed for {uid}: {e}')
+
+    db.document(f'users/{uid}').set({
+        'intervals': {
+            'backfillStatus': 'complete',
+            'backfillProgress': 100,
+            'last_sync_at': firestore.SERVER_TIMESTAMP,
+        },
+    }, merge=True)
 
     return {
         'status': 'ok',
-        'totalActivities': total_saved,
-        'hasMore': has_more,
-        'nextPage': page if has_more else None,
+        'totalWellness': total_w,
+        'totalActivities': total_a,
     }
 
 
@@ -597,9 +616,8 @@ def garmin_backfill(req: https_fn.CallableRequest) -> dict:
 # USER DATA DELETION (GDPR)
 # ══════════════════════════════════════════════════════
 
-@https_fn.on_call(region=REGION, timeout_sec=300, secrets=[GARMIN_KEY_SECRET])
+@https_fn.on_call(region=REGION, timeout_sec=300)
 def delete_user_data(req: https_fn.CallableRequest) -> dict:
-    """GDPR right to deletion — remove all user data."""
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
@@ -609,33 +627,28 @@ def delete_user_data(req: https_fn.CallableRequest) -> dict:
 
     subcollections = [
         'activities', 'healthLog', 'interventions', 'trainingPlans',
-        'garminDailies', 'garminSleep', 'activityStats', 'trends',
-        'backfillJobs', 'promptState',
+        'wellnessDaily', 'garminDailies', 'garminSleep', 'activityStats',
+        'trends', 'backfillJobs', 'promptState', 'cyclingProfile',
+        'lifetimeStats',
     ]
-
     for sub in subcollections:
         _delete_collection(f'users/{uid}/{sub}')
 
-    # Delete settings document
     db.document(f'users/{uid}').delete()
 
-    # Delete Firebase Auth account
     try:
         fb_auth.delete_user(uid)
     except Exception as e:
         print(f'Auth deletion failed: {e}')
 
-    # Anonymised audit trail
     db.collection('auditLog').add({
         'action': 'user_deletion',
         'timestamp': firestore.SERVER_TIMESTAMP,
     })
-
     return {'status': 'deleted'}
 
 
 def _delete_collection(path: str, batch_size: int = 100):
-    """Delete all documents in a Firestore collection."""
     coll_ref = db.collection(path)
     while True:
         docs = list(coll_ref.limit(batch_size).stream())
@@ -653,8 +666,9 @@ def _delete_collection(path: str, batch_size: int = 100):
 
 ANTHROPIC_KEY_SECRET = options.SecretParam('ANTHROPIC_API_KEY')
 
-DAILY_ANALYSIS_PROMPT = """You are a personal health and fitness analyst. You receive comprehensive health
-data from a Garmin wearable and manually logged health metrics. Your role is to:
+DAILY_ANALYSIS_PROMPT = """You are a personal health and fitness analyst. You receive comprehensive
+training and wellness data from intervals.icu (which aggregates a Garmin watch and Hammerhead Karoo)
+plus manually logged health metrics. Your role is to:
 
 1. ANALYSE the data for patterns, concerns, and opportunities
 2. GENERATE 2-4 prioritised interventions for today
@@ -666,8 +680,8 @@ CRITICAL RULES:
 - Resting HR change > 10bpm from baseline → flag recovery concern
 - HRV declining 3+ days → suggest recovery day
 - Sleep score < 60 for 3+ nights → prioritise sleep interventions
-- Body battery < 25 at morning → suggest light activity only
-- Training readiness score drives today's training intensity
+- Negative Form (TSB) for many days running → suggest deload
+- CTL ramp rate > +5/week → flag overtraining risk
 
 OUTPUT FORMAT (JSON only, no markdown fences):
 {
@@ -686,11 +700,12 @@ OUTPUT FORMAT (JSON only, no markdown fences):
 }"""
 
 WEEKLY_PLAN_PROMPT = """You are an expert running and fitness coach creating a personalised weekly
-training plan. You receive user profile, recent training data, Garmin metrics, and availability constraints.
+training plan. You receive user profile, recent training data, intervals.icu metrics
+(CTL/ATL/Form, wellness), and availability constraints.
 
 PRINCIPLES:
 - Progressive overload: max 10% volume increase per week
-- Respect recovery: use HRV, training readiness, and sleep data
+- Respect recovery: use HRV, Form (TSB), and sleep data
 - NEVER exceed the user's stated availability for any day
 - NEVER schedule on designated rest days
 - Total planned hours MUST be ≤ totalHoursPerWeek budget
@@ -720,7 +735,6 @@ OUTPUT FORMAT (JSON only, no markdown fences):
 
 
 def _get_anthropic_client():
-    """Create Anthropic client from secret."""
     import anthropic
     api_key = os.environ.get('ANTHROPIC_API_KEY', '')
     if not api_key:
@@ -728,26 +742,28 @@ def _get_anthropic_client():
     return anthropic.Anthropic(api_key=api_key)
 
 
-def _build_daily_context(uid: str) -> dict:
-    """Gather comprehensive health context for AI analysis."""
-    today_str = date.today().isoformat()
+def _get_wellness_for_date(uid: str, date_str: str) -> dict:
+    """Read wellness from intervals.icu collection first, fall back to historical Garmin."""
+    snap = db.document(f'users/{uid}/wellnessDaily/{date_str}').get()
+    if snap.exists:
+        return snap.to_dict()
+    snap = db.document(f'users/{uid}/garminDailies/{date_str}').get()
+    return snap.to_dict() if snap.exists else {}
 
-    # User settings
+
+def _build_daily_context(uid: str) -> dict:
+    today_str = date.today().isoformat()
     user_doc = db.document(f'users/{uid}').get().to_dict() or {}
 
-    # Today's Garmin data
-    today_snap = db.document(f'users/{uid}/garminDailies/{today_str}').get()
-    today_data = today_snap.to_dict() if today_snap.exists else {}
+    today_data = _get_wellness_for_date(uid, today_str)
 
-    # 7-day Garmin history
     week_data = []
     for i in range(7):
         d = (date.today() - timedelta(days=i)).isoformat()
-        snap = db.document(f'users/{uid}/garminDailies/{d}').get()
-        if snap.exists:
-            week_data.append(snap.to_dict())
+        entry = _get_wellness_for_date(uid, d)
+        if entry:
+            week_data.append(entry)
 
-    # Recent health log entries (last 30 days)
     health_entries = []
     health_q = db.collection(f'users/{uid}/healthLog').order_by(
         'date', direction='DESCENDING'
@@ -755,7 +771,6 @@ def _build_daily_context(uid: str) -> dict:
     for doc_snap in health_q.stream():
         health_entries.append(doc_snap.to_dict())
 
-    # Recent activities
     activities = []
     act_q = db.collection(f'users/{uid}/activities').order_by(
         'startTimeLocal', direction='DESCENDING'
@@ -783,13 +798,9 @@ def _build_daily_context(uid: str) -> dict:
 
 
 def _parse_ai_json(text: str) -> dict:
-    """Extract JSON from Claude response, handling markdown fences."""
     text = text.strip()
-    # Strip markdown fences (```json ... ``` or ``` ... ```)
     if text.startswith('```'):
-        # Find opening fence end
         first_nl = text.index('\n')
-        # Find closing fence
         last_fence = text.rfind('```', 3)
         if last_fence > 3:
             text = text[first_nl + 1:last_fence].strip()
@@ -816,7 +827,6 @@ def _parse_ai_json(text: str) -> dict:
     secrets=[ANTHROPIC_KEY_SECRET],
 )
 def ai_daily_analysis(req: https_fn.CallableRequest) -> dict:
-    """Run AI daily health analysis for a user."""
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
@@ -836,7 +846,6 @@ def ai_daily_analysis(req: https_fn.CallableRequest) -> dict:
 
     result = _parse_ai_json(response.content[0].text)
 
-    # Store interventions
     interventions = result.get('interventions', [])
     batch = db.batch()
     for interv in interventions:
@@ -869,7 +878,6 @@ def ai_daily_analysis(req: https_fn.CallableRequest) -> dict:
     secrets=[ANTHROPIC_KEY_SECRET],
 )
 def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
-    """Generate AI weekly training plan."""
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
@@ -889,9 +897,8 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
 
     result = _parse_ai_json(response.content[0].text)
 
-    # Store training plan — plan for the CURRENT week (Monday to Sunday)
     today = date.today()
-    days_since_monday = today.weekday()  # 0=Mon, 6=Sun
+    days_since_monday = today.weekday()
     week_start = today - timedelta(days=days_since_monday)
     week_end = week_start + timedelta(days=6)
 
@@ -931,7 +938,6 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
     secrets=[ANTHROPIC_KEY_SECRET],
 )
 def ai_on_demand(req: https_fn.CallableRequest) -> dict:
-    """Answer ad-hoc health/fitness questions with user context."""
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
@@ -958,9 +964,9 @@ def ai_on_demand(req: https_fn.CallableRequest) -> dict:
         model='claude-sonnet-4-5-20250929',
         max_tokens=1500,
         system="""You are a personal health and fitness assistant. You have access to the user's
-Garmin wearable data and health logs. Answer their question using this data.
-Be concise, specific, and actionable. Never diagnose medical conditions.
-If asked about concerning symptoms, recommend consulting a doctor.""",
+intervals.icu training/wellness data (sourced from Garmin and Hammerhead Karoo) and health logs.
+Answer their question using this data. Be concise, specific, and actionable. Never diagnose
+medical conditions. If asked about concerning symptoms, recommend consulting a doctor.""",
         messages=[
             {'role': 'user', 'content': f'My health data:\n{json.dumps(context, default=str)}\n\nQuestion: {question}'},
         ],
@@ -983,9 +989,7 @@ If asked about concerning symptoms, recommend consulting a doctor.""",
     timeout_sec=300,
 )
 def compute_activity_stats(event: scheduler_fn.ScheduledEvent) -> None:
-    """Nightly aggregation of activity stats per user."""
     users_ref = db.collection('users')
-
     for user_doc in users_ref.stream():
         uid = user_doc.id
         try:
@@ -996,7 +1000,6 @@ def compute_activity_stats(event: scheduler_fn.ScheduledEvent) -> None:
 
 @https_fn.on_call(region=REGION, timeout_sec=120)
 def compute_stats_on_demand(req: https_fn.CallableRequest) -> dict:
-    """Trigger activity stats computation for the calling user."""
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
@@ -1008,10 +1011,8 @@ def compute_stats_on_demand(req: https_fn.CallableRequest) -> dict:
 
 
 def _compute_all_stats(uid: str):
-    """Compute weekly (52 wks), monthly (24 mo), and yearly activity stats."""
     today = date.today()
 
-    # Load ALL activities with pagination
     all_activities = []
     last_doc = None
     while True:
@@ -1074,7 +1075,6 @@ def _compute_all_stats(uid: str):
         if batch_count >= 450:
             _flush()
 
-    # ── Weekly: last 52 weeks ──
     days_since_monday = today.weekday()
     current_week_start = today - timedelta(days=days_since_monday)
     for w in range(52):
@@ -1086,7 +1086,6 @@ def _compute_all_stats(uid: str):
             **_aggregate(acts),
         })
 
-    # ── Monthly: last 24 months ──
     for m in range(24):
         mo = today.month - m
         yr = today.year
@@ -1101,7 +1100,6 @@ def _compute_all_stats(uid: str):
             **_aggregate(acts),
         })
 
-    # ── Yearly: all years with data + current year ──
     years = {today.year}
     for act in all_activities:
         yr_str = (act.get('startTimeLocal') or '')[:4]
@@ -1126,7 +1124,6 @@ def _compute_all_stats(uid: str):
 
 @https_fn.on_call(region=REGION, timeout_sec=300)
 def data_export(req: https_fn.CallableRequest) -> dict:
-    """Export all user data as JSON (GDPR right to access)."""
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
@@ -1136,21 +1133,22 @@ def data_export(req: https_fn.CallableRequest) -> dict:
 
     export = {'exportedAt': datetime.utcnow().isoformat(), 'userId': uid}
 
-    # User settings (excluding encrypted fields)
     user_doc = db.document(f'users/{uid}').get()
     if user_doc.exists:
         settings = user_doc.to_dict()
-        garmin = settings.get('garmin', {})
-        garmin.pop('encrypted_tokens', None)
-        settings['garmin'] = garmin
+        # Strip encrypted credentials from export
+        intervals_cfg = settings.get('intervals', {}) or {}
+        intervals_cfg.pop('encrypted_api_key', None)
+        settings['intervals'] = intervals_cfg
+        garmin_cfg = settings.get('garmin', {}) or {}
+        garmin_cfg.pop('encrypted_tokens', None)
+        settings['garmin'] = garmin_cfg
         export['settings'] = settings
 
-    # Subcollections
     subcollections = [
-        'garminDailies', 'activities', 'healthLog',
+        'wellnessDaily', 'garminDailies', 'activities', 'healthLog',
         'interventions', 'trainingPlans', 'activityStats',
     ]
-
     for sub in subcollections:
         docs = []
         for doc_snap in db.collection(f'users/{uid}/{sub}').stream():

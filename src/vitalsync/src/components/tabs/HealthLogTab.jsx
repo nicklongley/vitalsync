@@ -7,7 +7,7 @@ import { useState, useMemo } from 'react';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
-import { useHealthLog, useGarminWeightHistory } from '@/hooks/useGarminData';
+import { useHealthLog, useWeightHistory } from '@/hooks/useIntervalsData';
 import { DateEntryPicker } from '@/components/shared';
 
 const ENTRY_TYPES = [
@@ -30,29 +30,28 @@ const MOOD_OPTIONS = [
 export default function HealthLogTab() {
   const { user } = useAuth();
   const { entries, loading } = useHealthLog(null, 20);
-  const { entries: garminWeights } = useGarminWeightHistory(30);
+  const { entries: syncedWeights } = useWeightHistory(30);
   const [activeType, setActiveType] = useState('weight');
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
 
-  // Merge manual entries with Garmin weight data for display
+  // Merge manual entries with synced weight data for display
   const mergedEntries = useMemo(() => {
     const manualDates = new Set(entries.filter(e => e.type === 'weight').map(e => e.date));
-    // Add Garmin weights for dates that don't have a manual weight entry
-    const garminEntries = garminWeights
-      .filter(gw => !manualDates.has(gw.date))
-      .map(gw => ({
-        id: `garmin-${gw.date}`,
+    const syncedEntries = syncedWeights
+      .filter(sw => !manualDates.has(sw.date))
+      .map(sw => ({
+        id: `${sw.source || 'sync'}-${sw.date}`,
         type: 'weight',
-        date: gw.date,
-        value: gw.value,
+        date: sw.date,
+        value: sw.value,
         unit: 'kg',
-        bodyFat: gw.bodyFat,
-        source: 'garmin',
+        bodyFat: sw.bodyFat,
+        source: sw.source || 'intervals',
       }));
-    return [...entries, ...garminEntries].sort((a, b) => b.date.localeCompare(a.date));
-  }, [entries, garminWeights]);
+    return [...entries, ...syncedEntries].sort((a, b) => b.date.localeCompare(a.date));
+  }, [entries, syncedWeights]);
 
   // Form state
   const [weight, setWeight] = useState('');
@@ -399,6 +398,9 @@ export default function HealthLogTab() {
                   <p className="text-sm text-white font-medium">{formatEntry(entry)}</p>
                   <p className="text-[10px] text-slate-500">
                     {entry.date}
+                    {entry.source === 'intervals' && (
+                      <span className="ml-1.5 px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-400 text-[9px] font-medium">intervals.icu</span>
+                    )}
                     {entry.source === 'garmin' && (
                       <span className="ml-1.5 px-1.5 py-0.5 rounded bg-blue-900/40 text-blue-400 text-[9px] font-medium">Garmin</span>
                     )}
