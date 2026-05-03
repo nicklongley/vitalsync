@@ -16,7 +16,7 @@ const SettingsTab = lazy(() => import('@/components/tabs/SettingsTab'));
 const TABS = [
   { id: 'Dashboard', icon: '\u2302' },
   { id: 'Health Log', icon: '\u2764' },
-  { id: 'Training', icon: '\uD83C\uDFC3' },
+  { id: 'Plan', icon: '\uD83C\uDFC3' },
   { id: 'Cycling', icon: '\uD83D\uDEB4' },
   { id: 'History', icon: '\uD83D\uDCC5' },
   { id: 'Insights', icon: '\uD83D\uDCC8' },
@@ -26,7 +26,7 @@ const TABS = [
 const TAB_COMPONENTS = {
   Dashboard: DashboardTab,
   'Health Log': HealthLogTab,
-  Training: TrainingTab,
+  Plan: TrainingTab,
   Cycling: CyclingTab,
   History: HistoryTab,
   Insights: InsightsTab,
