@@ -11,6 +11,7 @@ const TrainingTab = lazy(() => import('@/components/tabs/TrainingTab'));
 const CyclingTab = lazy(() => import('@/components/tabs/CyclingTab'));
 const HistoryTab = lazy(() => import('@/components/tabs/HistoryTab'));
 const InsightsTab = lazy(() => import('@/components/tabs/InsightsTab'));
+const AIContextTab = lazy(() => import('@/components/tabs/AIContextTab'));
 const SettingsTab = lazy(() => import('@/components/tabs/SettingsTab'));
 
 const TABS = [
@@ -20,6 +21,7 @@ const TABS = [
   { id: 'Cycling', icon: '\uD83D\uDEB4' },
   { id: 'History', icon: '\uD83D\uDCC5' },
   { id: 'Insights', icon: '\uD83D\uDCC8' },
+  { id: 'AI Context', icon: '\uD83E\uDDE0' },
   { id: 'Settings', icon: '\u2699' },
 ];
 
@@ -30,6 +32,7 @@ const TAB_COMPONENTS = {
   Cycling: CyclingTab,
   History: HistoryTab,
   Insights: InsightsTab,
+  'AI Context': AIContextTab,
   Settings: SettingsTab,
 };
 
