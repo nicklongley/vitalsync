@@ -54,12 +54,12 @@ export default function TrainingTab() {
     setContextModalOpen(true);
   }
 
-  async function generatePlan(contextText) {
+  async function generatePlan(contextText, weekStartDate) {
     setGenerating(true);
     setError('');
     try {
       const fn = httpsCallable(functions, 'ai_weekly_plan');
-      await fn({ context: contextText || '' });
+      await fn({ context: contextText || '', weekStartDate: weekStartDate || '' });
       setContextModalOpen(false);
     } catch (err) {
       console.error('Plan generation failed:', err);

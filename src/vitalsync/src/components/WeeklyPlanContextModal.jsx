@@ -17,17 +17,47 @@ const QUICK_CHIPS = [
   { label: 'Rest week', text: 'Recovery week — reduce volume by ~30% across the board.' },
 ];
 
+// Compute the Monday of "this week" and "next week" relative to now.
+function computeWeeks() {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const dowFromMon = (today.getDay() + 6) % 7;  // 0=Mon..6=Sun
+  const thisMon = new Date(today);
+  thisMon.setDate(today.getDate() - dowFromMon);
+  const nextMon = new Date(thisMon);
+  nextMon.setDate(thisMon.getDate() + 7);
+  return { thisMon, nextMon, dowFromMon };
+}
+
+function fmtRange(monday) {
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  const fmt = (d) => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  return `${fmt(monday)} – ${fmt(sunday)}`;
+}
+
+function isoDate(d) {
+  // Local-tz YYYY-MM-DD (avoids the toISOString UTC drift problem)
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 export default function WeeklyPlanContextModal({ open, initialContext = '', onCancel, onSubmit, generating }) {
   const [text, setText] = useState('');
+  // Default: Mon-Wed → this week; Thu-Sun → next week
+  const { thisMon, nextMon, dowFromMon } = computeWeeks();
+  const [forNextWeek, setForNextWeek] = useState(dowFromMon >= 3);
   const textareaRef = useRef(null);
 
   useEffect(() => {
     if (open) {
       setText(initialContext || '');
-      // Focus shortly after open to give the modal time to render
+      setForNextWeek(dowFromMon >= 3);
       setTimeout(() => textareaRef.current?.focus(), 50);
     }
-  }, [open, initialContext]);
+  }, [open, initialContext, dowFromMon]);
 
   if (!open) return null;
 
@@ -42,7 +72,8 @@ export default function WeeklyPlanContextModal({ open, initialContext = '', onCa
   }
 
   function handleSubmit() {
-    onSubmit(text.trim());
+    const targetMon = forNextWeek ? nextMon : thisMon;
+    onSubmit(text.trim(), isoDate(targetMon));
   }
 
   return (
@@ -50,10 +81,41 @@ export default function WeeklyPlanContextModal({ open, initialContext = '', onCa
          onClick={(e) => { if (e.target === e.currentTarget && !generating) onCancel(); }}>
       <div className="glass-card w-full max-w-md max-h-[90vh] overflow-y-auto p-5 space-y-4 animate-fade-in">
         <div>
-          <p className="text-base font-semibold text-white">What should this week's plan account for?</p>
+          <p className="text-base font-semibold text-white">Plan for which week?</p>
           <p className="text-xs text-slate-400 mt-1">
-            Anything ad-hoc that affects training — travel, races, illness, work stress. The AI treats these as hard constraints.
+            Pick the target week and add any ad-hoc constraints (travel, races, illness, work stress). The AI treats notes as hard rules.
           </p>
+        </div>
+
+        {/* Week selector */}
+        <div>
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-2">Target week</p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setForNextWeek(false)}
+              disabled={generating}
+              className={`flex-1 px-3 py-3 rounded-xl text-xs font-medium transition-colors min-h-[44px] text-center ${
+                !forNextWeek
+                  ? 'bg-emerald-600/20 border border-emerald-700/50 text-emerald-400'
+                  : 'bg-slate-800 border border-slate-700 text-slate-400 hover:border-slate-600'
+              }`}
+            >
+              <span className="block font-semibold">This week</span>
+              <span className="block text-[10px] text-slate-500 mt-0.5">{fmtRange(thisMon)}</span>
+            </button>
+            <button
+              onClick={() => setForNextWeek(true)}
+              disabled={generating}
+              className={`flex-1 px-3 py-3 rounded-xl text-xs font-medium transition-colors min-h-[44px] text-center ${
+                forNextWeek
+                  ? 'bg-emerald-600/20 border border-emerald-700/50 text-emerald-400'
+                  : 'bg-slate-800 border border-slate-700 text-slate-400 hover:border-slate-600'
+              }`}
+            >
+              <span className="block font-semibold">Next week</span>
+              <span className="block text-[10px] text-slate-500 mt-0.5">{fmtRange(nextMon)}</span>
+            </button>
+          </div>
         </div>
 
         {/* Quick-pick chips */}

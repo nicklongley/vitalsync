@@ -1269,6 +1269,23 @@ def ai_daily_analysis(req: https_fn.CallableRequest) -> dict:
     }
 
 
+def _resolve_plan_week_start(param: str = '') -> date:
+    """Resolve which week the plan is for.
+    If a date string is supplied, snap to its Monday. Otherwise use a
+    smart default: Mon-Wed → this week, Thu-Sun → next week.
+    """
+    if param:
+        try:
+            d = date.fromisoformat(param[:10])
+            return d - timedelta(days=d.weekday())  # snap to Monday
+        except (ValueError, TypeError):
+            pass
+    today = date.today()
+    if today.weekday() <= 2:
+        return today - timedelta(days=today.weekday())
+    return today + timedelta(days=(7 - today.weekday()))
+
+
 # ══════════════════════════════════════════════════════
 # AI WEEKLY TRAINING PLAN
 # ══════════════════════════════════════════════════════
@@ -1290,15 +1307,28 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
     user_context_text = (req.data.get('context') or '').strip() if req.data else ''
     user_context_text = user_context_text[:2000]  # cap
 
+    week_start_param = (req.data.get('weekStartDate') or '').strip() if req.data else ''
+    week_start = _resolve_plan_week_start(week_start_param)
+    week_end = week_start + timedelta(days=6)
+
     context = _build_daily_context(uid)
+    context['planWeekStartDate'] = week_start.isoformat()
+    context['planWeekEndDate'] = week_end.isoformat()
     client = _get_anthropic_client()
 
     user_message = json.dumps(context, default=str)
+    target_week_note = (
+        f'PLAN FOR THE WEEK STARTING {week_start.isoformat()} (Monday) '
+        f'THROUGH {week_end.isoformat()} (Sunday).'
+    )
     if user_context_text:
         user_message = (
+            f'{target_week_note}\n\n'
             f'USER CONTEXT FOR THIS WEEK (treat as hard constraints):\n{user_context_text}\n\n'
             f'TRAINING DATA:\n{user_message}'
         )
+    else:
+        user_message = f'{target_week_note}\n\nTRAINING DATA:\n{user_message}'
 
     response = client.messages.create(
         model='claude-sonnet-4-5-20250929',
@@ -1308,11 +1338,6 @@ def ai_weekly_plan(req: https_fn.CallableRequest) -> dict:
     )
 
     result = _parse_ai_json(response.content[0].text)
-
-    today = date.today()
-    days_since_monday = today.weekday()
-    week_start = today - timedelta(days=days_since_monday)
-    week_end = week_start + timedelta(days=6)
 
     sessions = result.get('sessions', [])
     for s in sessions:
