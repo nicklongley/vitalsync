@@ -192,13 +192,30 @@ _TYPE_MAP = {
 }
 
 
+def _first(*vals):
+    """Return the first non-None, non-zero value (or None)."""
+    for v in vals:
+        if v is not None and v != 0 and v != '':
+            return v
+    return None
+
+
 def _map_intervals_activity(act: dict) -> dict:
-    """intervals.icu activity → Garmin-compatible schema for frontend."""
+    """intervals.icu activity → Garmin-compatible schema for frontend.
+    Tries multiple field-name variants because the list and detail endpoints don't
+    always return the same keys (e.g. average_watts vs icu_average_watts vs avgPower).
+    """
     act_id = act.get('id')
     raw_type = act.get('type', '') or ''
     type_key = _TYPE_MAP.get(raw_type, raw_type.lower() or 'other')
-    joules = act.get('icu_joules') or 0
-    calories = int(joules / 4184) if joules else None
+    if act.get('calories'):
+        calories = int(act['calories'])
+    elif act.get('kilojoules'):
+        calories = int(act['kilojoules'] / 4.184)
+    elif act.get('icu_joules'):
+        calories = int(act['icu_joules'] / 4184)
+    else:
+        calories = None
     return {
         'activityId': f'intervals_{act_id}',
         'intervalsId': act_id,
@@ -206,23 +223,23 @@ def _map_intervals_activity(act: dict) -> dict:
         'description': act.get('description'),
         'startTimeLocal': act.get('start_date_local'),
         'startTimeGMT': act.get('start_date'),
-        'duration': act.get('elapsed_time'),
-        'movingDuration': act.get('moving_time'),
+        'duration': _first(act.get('elapsed_time'), act.get('icu_duration')),
+        'movingDuration': _first(act.get('moving_time'), act.get('icu_moving_time')),
         'distance': act.get('distance'),
-        'elevationGain': act.get('total_elevation_gain'),
+        'elevationGain': _first(act.get('total_elevation_gain'), act.get('elevationGain')),
         'elevationLoss': act.get('total_elevation_loss'),
         'calories': calories,
-        'averageHR': act.get('average_heartrate'),
-        'maxHR': act.get('max_heartrate'),
-        'averagePower': act.get('average_watts'),
-        'normalizedPower': act.get('icu_weighted_avg_watts'),
-        'maxPower': act.get('max_watts'),
+        'averageHR': _first(act.get('average_heartrate'), act.get('avgHr'), act.get('icu_average_heartrate')),
+        'maxHR': _first(act.get('max_heartrate'), act.get('maxHr')),
+        'averagePower': _first(act.get('average_watts'), act.get('icu_average_watts'), act.get('avgPower')),
+        'normalizedPower': _first(act.get('icu_weighted_avg_watts'), act.get('weighted_average_watts')),
+        'maxPower': _first(act.get('max_watts'), act.get('maxPower')),
         'averageSpeed': act.get('average_speed'),
         'maxSpeed': act.get('max_speed'),
-        'averageCadence': act.get('average_cadence'),
-        'trainingLoad': act.get('icu_training_load'),
-        'intensityFactor': act.get('icu_intensity'),
-        'tss': act.get('icu_training_load'),
+        'averageCadence': _first(act.get('average_cadence'), act.get('avg_cadence')),
+        'trainingLoad': _first(act.get('icu_training_load'), act.get('trainingLoad')),
+        'intensityFactor': _first(act.get('icu_intensity'), act.get('intensityFactor')),
+        'tss': _first(act.get('icu_training_load'), act.get('trainingLoad')),
         'ftpAtTime': act.get('icu_ftp'),
         'activityType': {'typeKey': type_key},
         'rawType': raw_type,
@@ -632,10 +649,11 @@ _DEFAULT_STREAM_TYPES = 'time,watts,heartrate,cadence,altitude,distance,velocity
     secrets=[ENCRYPTION_KEY_SECRET],
 )
 def intervals_get_activity_streams(req: https_fn.CallableRequest) -> dict:
-    """Fetch activity streams (HR, power, cadence, etc.) from intervals.icu on demand.
-    Streams are not persisted to Firestore — they're only loaded when a user opens
-    an activity detail page. Returns a dict keyed by stream type name with
-    parallel-array values (i.e. data[i] across types is the same time sample).
+    """Fetch fresh activity detail + streams from intervals.icu on demand.
+
+    Returns the full activity object (richer than what we persist in Firestore — the
+    list-endpoint summary may lack some power/HR fields) plus a streams dict keyed
+    by type name (parallel arrays).
     """
     if not req.auth:
         raise https_fn.HttpsError(
@@ -654,6 +672,11 @@ def intervals_get_activity_streams(req: https_fn.CallableRequest) -> dict:
 
     api_key = _get_user_api_key(uid)
     try:
+        detail = _intervals_request(
+            api_key,
+            f'/activity/{intervals_id}',
+            default={},
+        ) or {}
         result = _intervals_request(
             api_key,
             f'/activity/{intervals_id}/streams',
@@ -669,8 +692,8 @@ def intervals_get_activity_streams(req: https_fn.CallableRequest) -> dict:
             message='intervals.icu rejected the API key.',
         )
 
-    # intervals.icu returns a list of {type, name, valueType, data: [...]} objects.
-    # Flatten into a dict keyed by type name for easier consumption client-side.
+    # intervals.icu returns streams as a list of {type, name, valueType, data: [...]}.
+    # Flatten to a dict keyed by type name for easier consumption client-side.
     streams = {}
     if isinstance(result, list):
         for stream in result:
@@ -678,10 +701,12 @@ def intervals_get_activity_streams(req: https_fn.CallableRequest) -> dict:
                 t = stream.get('type')
                 data = stream.get('data')
                 if t and isinstance(data, list):
-                    # Cap at 5000 samples to keep payload reasonable for charts
                     streams[t] = data[:5000] if len(data) > 5000 else data
 
-    return {'status': 'ok', 'streams': streams}
+    # Sanitize detail to drop heavy nested arrays (laps, etc. — UI doesn't need them).
+    detail_clean = _sanitize_for_firestore(detail) if detail else {}
+
+    return {'status': 'ok', 'detail': detail_clean, 'streams': streams}
 
 
 # ══════════════════════════════════════════════════════
