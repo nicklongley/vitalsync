@@ -78,7 +78,7 @@ export default function DashboardTab() {
   const { data: todayData, loading } = useTodayWellness();
   const { data: weekData } = useWeekWellness();
   const { connected, backfillStatus, backfillProgress, syncing, syncNow, lastSyncAt } = useIntervalsSync();
-  const { activities } = useRecentActivities(5);
+  const { activities } = useRecentActivities(50);
   const [dismissedPrompts, setDismissedPrompts] = useState([]);
   const [interventions, setInterventions] = useState([]);
   const [loadingInterventions, setLoadingInterventions] = useState(true);
@@ -142,8 +142,29 @@ export default function DashboardTab() {
     });
   }, [weekData]);
 
-  const ftp = userSettings?.profile?.ftp || 0;
   const profileWeight = userSettings?.profile?.weight || 0;
+
+  // This-week totals from recent activities (real-time; not waiting for nightly aggregate)
+  const weekTotals = useMemo(() => {
+    const now = new Date();
+    const daysFromMon = (now.getDay() + 6) % 7;  // Mon=0..Sun=6
+    const weekStart = new Date(now);
+    weekStart.setDate(now.getDate() - daysFromMon);
+    weekStart.setHours(0, 0, 0, 0);
+    const weekStartISO = weekStart.toISOString().slice(0, 10);
+    let secs = 0;
+    let cals = 0;
+    let count = 0;
+    for (const a of activities) {
+      const d = (a.startTimeLocal || '').slice(0, 10);
+      if (d >= weekStartISO) {
+        secs += a.duration || a.movingDuration || 0;
+        cals += a.calories || 0;
+        count += 1;
+      }
+    }
+    return { minutes: Math.round(secs / 60), calories: Math.round(cals), count };
+  }, [activities]);
 
   if (loading) {
     return (
@@ -174,7 +195,9 @@ export default function DashboardTab() {
   const firstName = user?.displayName?.split(' ')[0] || 'Athlete';
 
   const currentWeight = todayWeight || profileWeight || 0;
-  const wkg = ftp && currentWeight ? (ftp / currentWeight).toFixed(2) : null;
+  const activeDisplay = weekTotals.minutes >= 60
+    ? { value: (weekTotals.minutes / 60).toFixed(1), unit: 'h' }
+    : { value: weekTotals.minutes || 0, unit: 'min' };
 
   function dismiss(key) {
     setDismissedPrompts(prev => [...prev, key]);
@@ -260,23 +283,24 @@ export default function DashboardTab() {
           subtitle={steps ? '' : 'Not synced today'}
         />
         <MetricCard
-          icon={"⚡"}
-          title="FTP"
-          value={ftp ? `${ftp}W` : '--'}
-          subtitle={wkg ? `${wkg} W/kg` : 'Set in Settings'}
-        />
-        <MetricCard
-          icon={"⚖️"}
-          title="Weight"
-          value={currentWeight ? `${currentWeight}` : '--'}
-          unit="kg"
-          subtitle={todayBodyFat ? `Body fat: ${todayBodyFat}%` : (todayWeight ? 'From intervals.icu' : '')}
-        />
-        <MetricCard
           icon={"🔥"}
           title="Fatigue"
           value={atl || '--'}
           subtitle={ctl ? `Fitness: ${ctl}` : ''}
+        />
+        <MetricCard
+          icon={"⏱️"}
+          title="Active This Week"
+          value={activeDisplay.value}
+          unit={activeDisplay.unit}
+          subtitle={weekTotals.count ? `${weekTotals.count} session${weekTotals.count === 1 ? '' : 's'}` : 'No activities yet'}
+        />
+        <MetricCard
+          icon={"🍔"}
+          title="Calories This Week"
+          value={weekTotals.calories ? weekTotals.calories.toLocaleString() : '--'}
+          unit="kcal"
+          subtitle="From activities"
         />
       </div>
 
@@ -400,7 +424,7 @@ export default function DashboardTab() {
         {activities.length === 0 ? (
           <p className="text-sm text-slate-500 text-center py-4">No activities yet. Connect intervals.icu to see recent workouts.</p>
         ) : null}
-        {activities.map((act, i) => {
+        {activities.slice(0, 5).map((act, i) => {
           const typeKey = act.activityType?.typeKey || act.sport || '';
           const sportIcon = SPORT_ICONS[typeKey] || '🏃';
           return (
