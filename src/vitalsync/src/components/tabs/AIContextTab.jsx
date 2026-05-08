@@ -338,9 +338,14 @@ function DomainCapture({ domain }) {
   async function saveAnswer(questionId, value) {
     if (!user) return;
     const trimmed = (value || '').trim();
+    // Denormalised _lastUpdatedAt feeds the Helper API freshness probe so
+    // recompile-if-stale knows when capture answers changed.
     await setDoc(doc(db, 'users', user.uid), {
       aiContextCapture: {
-        [domain.id]: { [questionId]: { answer: trimmed, updatedAt: serverTimestamp() } },
+        [domain.id]: {
+          [questionId]: { answer: trimmed, updatedAt: serverTimestamp() },
+          _lastUpdatedAt: serverTimestamp(),
+        },
       },
     }, { merge: true });
   }

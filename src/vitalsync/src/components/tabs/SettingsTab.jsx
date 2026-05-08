@@ -256,6 +256,9 @@ export default function SettingsTab() {
         </p>
       </div>
 
+      {/* ── Helper API Keys ── */}
+      <HelperApiKeysPanel uid={user?.uid} />
+
       {/* ── Performance Metrics ── */}
       <div className="glass-card p-5">
         <p className="text-xs text-slate-400 uppercase tracking-wider mb-1">Performance Metrics</p>
@@ -541,6 +544,176 @@ export default function SettingsTab() {
     </div>
   );
 }
+
+// ──────────────────────────────────────────────────────────────
+// Helper API Keys panel — generate / list / revoke bearer tokens
+// for the local Claude Code helper agent.
+// ──────────────────────────────────────────────────────────────
+function HelperApiKeysPanel({ uid }) {
+  const [keys, setKeys] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [label, setLabel] = useState('');
+  const [revealedToken, setRevealedToken] = useState('');
+  const [error, setError] = useState('');
+
+  async function refresh() {
+    if (!uid) return;
+    setLoading(true);
+    try {
+      const fn = httpsCallable(functions, 'helper_api_list_keys');
+      const res = await fn();
+      setKeys(res?.data?.keys || []);
+    } catch (err) {
+      console.error('list keys failed:', err);
+      setError(err.message || 'Failed to list keys');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [uid]);
+
+  async function createKey() {
+    if (!uid) return;
+    setCreating(true);
+    setError('');
+    setRevealedToken('');
+    try {
+      const fn = httpsCallable(functions, 'helper_api_create_key');
+      const res = await fn({ label: label.trim() });
+      setRevealedToken(res?.data?.token || '');
+      setLabel('');
+      refresh();
+    } catch (err) {
+      console.error('create key failed:', err);
+      setError(err.message || 'Failed to generate key');
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function revokeKey(prefix) {
+    if (!confirm('Revoke this key? Any helper using it will stop working.')) return;
+    try {
+      const fn = httpsCallable(functions, 'helper_api_revoke_key');
+      await fn({ prefix });
+      refresh();
+    } catch (err) {
+      console.error('revoke failed:', err);
+      setError(err.message || 'Failed to revoke');
+    }
+  }
+
+  function copyToken() {
+    if (!revealedToken) return;
+    navigator.clipboard?.writeText(revealedToken);
+  }
+
+  return (
+    <div className="glass-card p-5">
+      <p className="text-xs text-slate-400 uppercase tracking-wider mb-1">Helper API Keys</p>
+      <p className="text-[10px] text-slate-600 mb-4">
+        Bearer tokens for the local AI helper agent to fetch your <code className="text-emerald-400">.me</code> /{' '}
+        <code className="text-emerald-400">.focus</code> files via REST. Read-only; cannot modify any data.
+      </p>
+
+      {/* Generate new */}
+      <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-3 space-y-2 mb-3">
+        <input
+          type="text"
+          placeholder="Label (e.g. 'home laptop')"
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+          disabled={creating}
+          maxLength={60}
+          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm
+                     placeholder:text-slate-600 focus:outline-none focus:border-emerald-600 transition-colors"
+        />
+        <button
+          onClick={createKey}
+          disabled={creating}
+          className="w-full py-2 rounded-lg text-xs font-medium bg-emerald-600 text-white
+                     hover:bg-emerald-500 disabled:opacity-50 transition-colors min-h-[36px]"
+        >
+          {creating ? 'Generating…' : 'Generate New Key'}
+        </button>
+      </div>
+
+      {revealedToken && (
+        <div className="bg-emerald-950/30 border border-emerald-800/40 rounded-xl p-3 mb-3 space-y-2">
+          <p className="text-[11px] text-emerald-400 font-medium">
+            Copy this token now — it will not be shown again.
+          </p>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={revealedToken}
+              readOnly
+              className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-emerald-300 text-[11px] font-mono"
+            />
+            <button
+              onClick={copyToken}
+              className="px-2 py-1.5 rounded-lg text-[11px] bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700 transition-colors"
+            >
+              Copy
+            </button>
+          </div>
+          <p className="text-[10px] text-slate-400">
+            Store at <code>~/.config/personal-helper/vitalsync-key.txt</code> (chmod 600).
+          </p>
+          <button
+            onClick={() => setRevealedToken('')}
+            className="text-[10px] text-slate-500 hover:text-slate-300"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {error && <p className="text-[11px] text-rose-400 mb-2">{error}</p>}
+
+      {/* List existing */}
+      <div className="space-y-1.5">
+        {loading ? (
+          <p className="text-[11px] text-slate-500">Loading…</p>
+        ) : keys.length === 0 ? (
+          <p className="text-[11px] text-slate-500">No keys yet.</p>
+        ) : (
+          keys.map((k) => (
+            <div
+              key={k.prefix}
+              className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg border ${
+                k.revoked ? 'bg-slate-800/30 border-slate-800 opacity-60' : 'bg-slate-800/50 border-slate-700/50'
+              }`}
+            >
+              <div className="min-w-0 flex-1">
+                <p className="text-xs text-white font-medium truncate">
+                  {k.label || `vsync_${k.prefix}_…`}
+                  {k.revoked && <span className="ml-1.5 text-[9px] text-rose-400">revoked</span>}
+                </p>
+                <p className="text-[10px] text-slate-600">
+                  prefix <span className="font-mono">{k.prefix}</span>
+                  {' · '}
+                  {k.lastUsedAt ? `used ${new Date(k.lastUsedAt).toLocaleString()}` : 'never used'}
+                </p>
+              </div>
+              {!k.revoked && (
+                <button
+                  onClick={() => revokeKey(k.prefix)}
+                  className="text-[10px] text-rose-400 hover:text-rose-300 transition-colors px-2 py-1 min-h-[28px]"
+                >
+                  Revoke
+                </button>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 
 // ──────────────────────────────────────────────────────────────
 // Performance metric row: shows current value + source badge,

@@ -1875,31 +1875,68 @@ def _name_for(uid: str) -> str:
     return user.get('displayName') or user.get('email', '').split('@')[0] or 'Athlete'
 
 
-def _persist_ai_context_file(uid: str, file_id: str, domain: str, kind: str, content: str) -> None:
-    db.document(f'users/{uid}/aiContext/{file_id}').set({
+def _persist_ai_context_file(uid: str, file_id: str, domain: str, kind: str,
+                              content: str, source: str = 'ui') -> str | None:
+    """Write a freshly-compiled file. Captures the prior content into
+    previousContent so the helper API can compute section-level diffs on the
+    next read. Returns the prior content (or None if first compile).
+    """
+    ref = db.document(f'users/{uid}/aiContext/{file_id}')
+    snap = ref.get()
+    previous = (snap.to_dict() or {}).get('content') if snap.exists else None
+    ref.set({
         'fileId': file_id,
         'domain': domain,
         'kind': kind,
         'content': content,
+        'previousContent': previous,
         'generatedAt': firestore.SERVER_TIMESTAMP,
         'generatedBy': 'claude-sonnet-4-5-20250929',
+        'compileSource': source,
     }, merge=True)
+    return previous
 
 
-@https_fn.on_call(
-    region=REGION,
-    memory=options.MemoryOption.MB_512,
-    timeout_sec=120,
-    secrets=[ANTHROPIC_KEY_SECRET],
-)
-def ai_compile_training_focus(req: https_fn.CallableRequest) -> dict:
-    if not req.auth:
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-            message='Must be signed in',
-        )
-    uid = req.auth.uid
+import re
 
+def _markdown_sections(content: str) -> dict:
+    """Split markdown on top-level H2 headers; return {title: body}."""
+    if not content:
+        return {}
+    sections = {}
+    current_title = None
+    current_lines = []
+    for line in content.split('\n'):
+        m = re.match(r'^##\s+(.+?)\s*$', line)
+        if m:
+            if current_title is not None:
+                sections[current_title] = '\n'.join(current_lines).strip()
+            current_title = m.group(1).strip()
+            current_lines = []
+        else:
+            if current_title is not None:
+                current_lines.append(line)
+    if current_title is not None:
+        sections[current_title] = '\n'.join(current_lines).strip()
+    return sections
+
+
+def _diff_sections(old: str, new: str) -> list:
+    """Return list of H2 section titles whose body text differs between old and new."""
+    old_sections = _markdown_sections(old)
+    new_sections = _markdown_sections(new)
+    changed = []
+    for title, body in new_sections.items():
+        if old_sections.get(title) != body:
+            changed.append(title)
+    for title in old_sections:
+        if title not in new_sections and title not in changed:
+            changed.append(title)
+    return changed
+
+
+def _run_compile_training_focus(uid: str, source: str = 'ui') -> dict:
+    """Internal: compile training.focus.md and persist. Returns {content, previous}."""
     name = _name_for(uid)
     today_iso = date.today().isoformat()
     user_doc = db.document(f'users/{uid}').get().to_dict() or {}
@@ -1958,8 +1995,24 @@ def ai_compile_training_focus(req: https_fn.CallableRequest) -> dict:
         messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
     )
     content = response.content[0].text.strip()
-    _persist_ai_context_file(uid, 'training_focus', 'training', 'focus', content)
-    return {'status': 'ok', 'fileId': 'training_focus', 'characters': len(content)}
+    previous = _persist_ai_context_file(uid, 'training_focus', 'training', 'focus', content, source=source)
+    return {'content': content, 'previous': previous}
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=120,
+    secrets=[ANTHROPIC_KEY_SECRET],
+)
+def ai_compile_training_focus(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    result = _run_compile_training_focus(req.auth.uid, source='ui')
+    return {'status': 'ok', 'fileId': 'training_focus', 'characters': len(result['content'])}
 
 
 def _activity_history_by_week(uid: str, weeks: int = 12) -> list:
@@ -2129,20 +2182,8 @@ def _existing_file_content(uid: str, file_id: str) -> str | None:
     return (snap.to_dict() or {}).get('content')
 
 
-@https_fn.on_call(
-    region=REGION,
-    memory=options.MemoryOption.GB_1,
-    timeout_sec=300,
-    secrets=[ANTHROPIC_KEY_SECRET],
-)
-def ai_compile_training_me(req: https_fn.CallableRequest) -> dict:
-    if not req.auth:
-        raise https_fn.HttpsError(
-            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-            message='Must be signed in',
-        )
-    uid = req.auth.uid
-
+def _run_compile_training_me(uid: str, source: str = 'ui') -> dict:
+    """Internal: compile training.me.md and persist."""
     name = _name_for(uid)
     today_iso = date.today().isoformat()
     user_doc = db.document(f'users/{uid}').get().to_dict() or {}
@@ -2151,7 +2192,7 @@ def ai_compile_training_me(req: https_fn.CallableRequest) -> dict:
     history = _activity_history_by_week(uid, weeks=12)
     ftp_samples = _ftp_samples_from_activities(uid, days=180)
     wellness_summary = _wellness_summary(uid, days=60)
-    previous = _existing_file_content(uid, 'training_me')
+    previous_content = _existing_file_content(uid, 'training_me')
 
     payload = {
         'name': name,
@@ -2169,7 +2210,7 @@ def ai_compile_training_me(req: https_fn.CallableRequest) -> dict:
         'activityHistoryByWeek': history,
         'ftpSamples': ftp_samples,
         'wellnessSummary': wellness_summary,
-        'previousFile': previous,
+        'previousFile': previous_content,
     }
 
     client = _get_anthropic_client()
@@ -2180,8 +2221,8 @@ def ai_compile_training_me(req: https_fn.CallableRequest) -> dict:
         messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
     )
     content = response.content[0].text.strip()
-    _persist_ai_context_file(uid, 'training_me', 'training', 'me', content)
-    return {'status': 'ok', 'fileId': 'training_me', 'characters': len(content)}
+    previous = _persist_ai_context_file(uid, 'training_me', 'training', 'me', content, source=source)
+    return {'content': content, 'previous': previous}
 
 
 @https_fn.on_call(
@@ -2190,21 +2231,25 @@ def ai_compile_training_me(req: https_fn.CallableRequest) -> dict:
     timeout_sec=300,
     secrets=[ANTHROPIC_KEY_SECRET],
 )
-def ai_compile_health_me(req: https_fn.CallableRequest) -> dict:
+def ai_compile_training_me(req: https_fn.CallableRequest) -> dict:
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
-    uid = req.auth.uid
+    result = _run_compile_training_me(req.auth.uid, source='ui')
+    return {'status': 'ok', 'fileId': 'training_me', 'characters': len(result['content'])}
 
+
+def _run_compile_health_me(uid: str, source: str = 'ui') -> dict:
+    """Internal: compile health.me.md and persist."""
     name = _name_for(uid)
     today_iso = date.today().isoformat()
     user_doc = db.document(f'users/{uid}').get().to_dict() or {}
     profile = user_doc.get('profile') or {}
     capture = _capture_for(uid, 'health')
     wellness_summary = _wellness_summary(uid, days=60)
-    previous = _existing_file_content(uid, 'health_me')
+    previous_content = _existing_file_content(uid, 'health_me')
 
     payload = {
         'name': name,
@@ -2219,7 +2264,7 @@ def ai_compile_health_me(req: https_fn.CallableRequest) -> dict:
         },
         'capturedContext': capture,
         'wellnessSummary': wellness_summary,
-        'previousFile': previous,
+        'previousFile': previous_content,
     }
 
     client = _get_anthropic_client()
@@ -2230,30 +2275,33 @@ def ai_compile_health_me(req: https_fn.CallableRequest) -> dict:
         messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
     )
     content = response.content[0].text.strip()
-    _persist_ai_context_file(uid, 'health_me', 'health', 'me', content)
-    return {'status': 'ok', 'fileId': 'health_me', 'characters': len(content)}
+    previous = _persist_ai_context_file(uid, 'health_me', 'health', 'me', content, source=source)
+    return {'content': content, 'previous': previous}
 
 
 @https_fn.on_call(
     region=REGION,
-    memory=options.MemoryOption.MB_512,
-    timeout_sec=120,
+    memory=options.MemoryOption.GB_1,
+    timeout_sec=300,
     secrets=[ANTHROPIC_KEY_SECRET],
 )
-def ai_compile_health_focus(req: https_fn.CallableRequest) -> dict:
+def ai_compile_health_me(req: https_fn.CallableRequest) -> dict:
     if not req.auth:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
             message='Must be signed in',
         )
-    uid = req.auth.uid
+    result = _run_compile_health_me(req.auth.uid, source='ui')
+    return {'status': 'ok', 'fileId': 'health_me', 'characters': len(result['content'])}
 
+
+def _run_compile_health_focus(uid: str, source: str = 'ui') -> dict:
+    """Internal: compile health.focus.md and persist."""
     name = _name_for(uid)
     today_iso = date.today().isoformat()
     capture = _capture_for(uid, 'health')
     wellness_recent = _recent_wellness(uid, days=14)
 
-    # Trim wellness to fields relevant to the prompt (avoid blowing payload size)
     trimmed = []
     for w in wellness_recent:
         trimmed.append({
@@ -2280,8 +2328,24 @@ def ai_compile_health_focus(req: https_fn.CallableRequest) -> dict:
         messages=[{'role': 'user', 'content': json.dumps(payload, default=str)}],
     )
     content = response.content[0].text.strip()
-    _persist_ai_context_file(uid, 'health_focus', 'health', 'focus', content)
-    return {'status': 'ok', 'fileId': 'health_focus', 'characters': len(content)}
+    previous = _persist_ai_context_file(uid, 'health_focus', 'health', 'focus', content, source=source)
+    return {'content': content, 'previous': previous}
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=120,
+    secrets=[ANTHROPIC_KEY_SECRET],
+)
+def ai_compile_health_focus(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    result = _run_compile_health_focus(req.auth.uid, source='ui')
+    return {'status': 'ok', 'fileId': 'health_focus', 'characters': len(result['content'])}
 
 
 # ══════════════════════════════════════════════════════
@@ -2467,3 +2531,403 @@ def data_export(req: https_fn.CallableRequest) -> dict:
         export[sub] = docs
 
     return {'status': 'ok', 'data': export}
+
+
+# ══════════════════════════════════════════════════════
+# HELPER API — bearer-auth REST endpoints for the local helper agent
+# Batched read of training/health .me/.focus markdown files with optional
+# fresh recompile and per-file freshness/diff metadata.
+# ══════════════════════════════════════════════════════
+
+import hashlib
+import secrets
+
+_HELPER_API_FILES = {
+    'training.focus': ('training', 'focus', _run_compile_training_focus),
+    'training.me':    ('training', 'me',    _run_compile_training_me),
+    'health.focus':   ('health',   'focus', _run_compile_health_focus),
+    'health.me':      ('health',   'me',    _run_compile_health_me),
+}
+
+# Staleness thresholds for refresh=if-stale (seconds)
+_STALE_THRESHOLDS_SEC = {
+    'focus': 6 * 3600,   # 6h for focus files
+    'me':    24 * 3600,  # 24h for me files
+}
+
+
+def _hash_secret(secret: str) -> str:
+    return hashlib.sha256(secret.encode('utf-8')).hexdigest()
+
+
+def _validate_helper_token(token: str) -> dict | None:
+    """Resolve a bearer token to {uid, scopes, prefix} or None."""
+    if not token or not token.startswith('vsync_'):
+        return None
+    parts = token.split('_', 2)
+    if len(parts) != 3:
+        return None
+    _, prefix, secret = parts
+    if not prefix or not secret:
+        return None
+    snap = db.document(f'helperApiKeys/{prefix}').get()
+    if not snap.exists:
+        return None
+    data = snap.to_dict() or {}
+    if data.get('revoked'):
+        return None
+    if _hash_secret(secret) != data.get('hashedSecret'):
+        return None
+    # Best-effort lastUsedAt update; failures don't fail the request
+    try:
+        db.document(f'helperApiKeys/{prefix}').set({
+            'lastUsedAt': firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception:
+        pass
+    return {
+        'uid': data.get('uid'),
+        'scopes': data.get('scopes') or ['aicontext.read'],
+        'prefix': prefix,
+    }
+
+
+def _has_scope(auth: dict, scope: str) -> bool:
+    return scope in (auth.get('scopes') or [])
+
+
+def _capture_last_updated_at(uid: str, domain: str):
+    """Max updatedAt across captureAnswers in the domain. Prefers the denormalised
+    _lastUpdatedAt sentinel written on every save; falls back to scanning entries."""
+    user_doc = db.document(f'users/{uid}').get().to_dict() or {}
+    raw = (user_doc.get('aiContextCapture') or {}).get(domain) or {}
+    denorm = raw.get('_lastUpdatedAt')
+    if denorm is not None:
+        return denorm
+    latest = None
+    for entry in raw.values():
+        if not isinstance(entry, dict):
+            continue
+        ts = entry.get('updatedAt')
+        if ts is None:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _ts_to_iso(ts) -> str | None:
+    """Firestore Timestamp / datetime -> ISO string (UTC, with Z)."""
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        return ts
+    if hasattr(ts, 'isoformat'):
+        s = ts.isoformat()
+        # Normalise to ...Z if the timestamp is naive UTC
+        if s.endswith('+00:00'):
+            s = s[:-6] + 'Z'
+        return s
+    return str(ts)
+
+
+def _seconds_since(ts) -> float | None:
+    if ts is None:
+        return None
+    if hasattr(ts, 'timestamp'):
+        return (datetime.utcnow().timestamp() - ts.timestamp())
+    return None
+
+
+def _file_freshness(uid: str, domain: str, kind: str, file_meta: dict) -> dict:
+    """Compute freshness signals for a single file response."""
+    user_doc = db.document(f'users/{uid}').get().to_dict() or {}
+    intervals_cfg = user_doc.get('intervals') or {}
+    intervals_synced_at = intervals_cfg.get('last_sync_at')
+    capture_updated_at = _capture_last_updated_at(uid, domain)
+
+    intervals_age_sec = _seconds_since(intervals_synced_at)
+    intervals_status = 'fresh'
+    if intervals_synced_at is None:
+        intervals_status = 'broken'
+    elif intervals_age_sec is not None and intervals_age_sec > 24 * 3600:
+        intervals_status = 'broken'
+    elif intervals_age_sec is not None and intervals_age_sec > 6 * 3600:
+        intervals_status = 'stale'
+
+    return {
+        'intervals': {
+            'lastSyncedAt': _ts_to_iso(intervals_synced_at),
+            'ageMinutes': int(intervals_age_sec / 60) if intervals_age_sec is not None else None,
+            'status': intervals_status,
+        },
+        'captureAnswers': {
+            'lastUpdatedAt': _ts_to_iso(capture_updated_at),
+        },
+    }
+
+
+def _should_recompile_if_stale(file_meta: dict, freshness: dict, kind: str) -> bool:
+    """Return True if the cached file is older than the inputs that feed it."""
+    generated_at = file_meta.get('generatedAt') if file_meta else None
+    if not generated_at:
+        return True  # never compiled
+    gen_sec = _seconds_since(generated_at)
+    threshold = _STALE_THRESHOLDS_SEC.get(kind, 6 * 3600)
+    if gen_sec is not None and gen_sec > threshold:
+        return True
+    # If any input is newer than the file, stale
+    intervals_synced_at = (db.document(f'users/{file_meta.get("_uid", "")}').get().to_dict() or {}).get('intervals', {}).get('last_sync_at') if file_meta.get('_uid') else None
+    # Simpler: rely on freshness dict
+    intervals_iso = freshness.get('intervals', {}).get('lastSyncedAt')
+    capture_iso = freshness.get('captureAnswers', {}).get('lastUpdatedAt')
+    gen_iso = _ts_to_iso(generated_at)
+    if intervals_iso and gen_iso and intervals_iso > gen_iso:
+        return True
+    if capture_iso and gen_iso and capture_iso > gen_iso:
+        return True
+    return False
+
+
+def _read_file_meta(uid: str, file_id: str) -> dict | None:
+    snap = db.document(f'users/{uid}/aiContext/{file_id}').get()
+    return snap.to_dict() if snap.exists else None
+
+
+def _err_response(status: int, code: str, message: str, retriable: bool = False, **details):
+    body = {
+        'error': {
+            'code': code,
+            'message': message,
+            'retriable': retriable,
+        }
+    }
+    if details:
+        body['error']['details'] = details
+    return https_fn.Response(
+        json.dumps(body),
+        status=status,
+        headers={'Content-Type': 'application/json'},
+    )
+
+
+def _build_file_entry(uid: str, file_spec: str, refresh: str, meta_only: bool) -> dict:
+    """Compute a single file entry in the GET /v1/files response."""
+    if file_spec not in _HELPER_API_FILES:
+        return {
+            'fileId': file_spec,
+            'error': {'code': 'INVALID_FILE', 'message': f'Unknown file: {file_spec}'},
+        }
+    domain, kind, compile_fn = _HELPER_API_FILES[file_spec]
+    file_id = f'{domain}_{kind}'
+
+    file_meta = _read_file_meta(uid, file_id) or {}
+    freshness = _file_freshness(uid, domain, kind, file_meta)
+
+    sections_changed = []
+    was_recompiled = False
+    warnings = []
+
+    if not meta_only:
+        if refresh == 'force':
+            try:
+                result = compile_fn(uid, source='api')
+                file_meta = _read_file_meta(uid, file_id) or {}
+                freshness = _file_freshness(uid, domain, kind, file_meta)
+                was_recompiled = True
+                sections_changed = _diff_sections(result.get('previous') or '', result['content'])
+            except Exception as e:
+                print(f'helper_api compile failure ({file_id}): {e}')
+                warnings.append(f'Compilation failed: {e}')
+        elif refresh == 'if-stale':
+            if _should_recompile_if_stale(file_meta, freshness, kind):
+                try:
+                    result = compile_fn(uid, source='api')
+                    file_meta = _read_file_meta(uid, file_id) or {}
+                    freshness = _file_freshness(uid, domain, kind, file_meta)
+                    was_recompiled = True
+                    sections_changed = _diff_sections(result.get('previous') or '', result['content'])
+                except Exception as e:
+                    print(f'helper_api compile failure ({file_id}): {e}')
+                    warnings.append(f'Compilation failed: {e}')
+
+    if freshness['intervals']['status'] == 'stale':
+        warnings.append(f"intervals.icu sync is stale ({freshness['intervals']['ageMinutes']} min old)")
+    elif freshness['intervals']['status'] == 'broken':
+        warnings.append('intervals.icu sync has not run in over 24 hours or is not connected')
+
+    entry = {
+        'fileId': file_id,
+        'domain': domain,
+        'kind': kind,
+        'filename': f'{domain}.{kind}.md',
+        'wasRecompiled': was_recompiled,
+        'sectionsChanged': sections_changed,
+        'freshness': freshness,
+        'generatedAt': _ts_to_iso(file_meta.get('generatedAt')),
+        'editedAt': _ts_to_iso(file_meta.get('editedAt')),
+        'generatedBy': file_meta.get('generatedBy'),
+        'compileSource': file_meta.get('compileSource'),
+        'warnings': warnings,
+    }
+    if not meta_only:
+        entry['content'] = file_meta.get('content')
+    return entry
+
+
+@https_fn.on_request(
+    region=REGION,
+    memory=options.MemoryOption.GB_1,
+    timeout_sec=540,
+    secrets=[ANTHROPIC_KEY_SECRET, ENCRYPTION_KEY_SECRET],
+)
+def helper_api(req: https_fn.Request) -> https_fn.Response:
+    """Bearer-auth REST endpoint for the local helper agent.
+    Routes:
+      GET  /v1/files                  — batched read (cached / if-stale)
+      POST /v1/files/recompile        — batched force recompile
+    """
+    auth_header = req.headers.get('Authorization', '') or req.headers.get('authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return _err_response(401, 'AUTH_MISSING', 'Missing Authorization: Bearer <token> header')
+    token = auth_header[len('Bearer '):].strip()
+    auth = _validate_helper_token(token)
+    if not auth:
+        return _err_response(401, 'AUTH_INVALID', 'Helper API key revoked or not found')
+    if not _has_scope(auth, 'aicontext.read'):
+        return _err_response(403, 'SCOPE_DENIED', 'Token lacks aicontext.read scope')
+
+    path = req.path or '/'
+    method = req.method or 'GET'
+
+    if path == '/v1/files' and method == 'GET':
+        files_param = req.args.get('files') if hasattr(req, 'args') else None
+        if not files_param:
+            files_param = ','.join(_HELPER_API_FILES.keys())
+        refresh = (req.args.get('refresh') if hasattr(req, 'args') else None) or 'cached'
+        meta_only = ((req.args.get('meta_only') if hasattr(req, 'args') else None) or 'false').lower() == 'true'
+        if refresh not in ('cached', 'if-stale', 'force'):
+            return _err_response(400, 'INVALID_PARAM', f'refresh must be cached|if-stale|force')
+
+        requested = [f.strip() for f in files_param.split(',') if f.strip()]
+        files_out = [_build_file_entry(auth['uid'], f, refresh, meta_only) for f in requested]
+        return https_fn.Response(
+            json.dumps({'files': files_out}, default=str),
+            status=200,
+            headers={'Content-Type': 'application/json'},
+        )
+
+    if path == '/v1/files/recompile' and method == 'POST':
+        # Same payload as GET ?refresh=force
+        try:
+            body = req.get_json(silent=True) or {}
+        except Exception:
+            body = {}
+        files_param = body.get('files') if isinstance(body, dict) else None
+        if not files_param:
+            files_param = ','.join(_HELPER_API_FILES.keys())
+        if isinstance(files_param, list):
+            requested = files_param
+        else:
+            requested = [f.strip() for f in str(files_param).split(',') if f.strip()]
+        files_out = [_build_file_entry(auth['uid'], f, 'force', False) for f in requested]
+        return https_fn.Response(
+            json.dumps({'files': files_out}, default=str),
+            status=200,
+            headers={'Content-Type': 'application/json'},
+        )
+
+    return _err_response(404, 'NOT_FOUND', f'Unknown route: {method} {path}')
+
+
+# ══════════════════════════════════════════════════════
+# HELPER API KEY MANAGEMENT (callable, used by the web Settings tab)
+# ══════════════════════════════════════════════════════
+
+@https_fn.on_call(region=REGION)
+def helper_api_create_key(req: https_fn.CallableRequest) -> dict:
+    """Generate a new helper API key. Returns the FULL token once (not stored
+    in plaintext). Subsequent reads only return the prefix and metadata."""
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+    label = (req.data.get('label') if req.data else None) or ''
+    label = str(label)[:60]
+
+    prefix = secrets.token_hex(6)   # 12 chars
+    secret = secrets.token_hex(32)  # 64 chars
+    full_token = f'vsync_{prefix}_{secret}'
+
+    db.document(f'helperApiKeys/{prefix}').set({
+        'prefix': prefix,
+        'uid': uid,
+        'hashedSecret': _hash_secret(secret),
+        'label': label,
+        'scopes': ['aicontext.read'],
+        'createdAt': firestore.SERVER_TIMESTAMP,
+        'lastUsedAt': None,
+        'revoked': False,
+    })
+
+    return {
+        'token': full_token,
+        'prefix': prefix,
+        'label': label,
+    }
+
+
+@https_fn.on_call(region=REGION)
+def helper_api_list_keys(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+    keys = []
+    q = db.collection('helperApiKeys').where(
+        filter=google.cloud.firestore.FieldFilter('uid', '==', uid)
+    )
+    for doc_snap in q.stream():
+        d = doc_snap.to_dict() or {}
+        keys.append({
+            'prefix': d.get('prefix'),
+            'label': d.get('label') or '',
+            'createdAt': _ts_to_iso(d.get('createdAt')),
+            'lastUsedAt': _ts_to_iso(d.get('lastUsedAt')),
+            'revoked': d.get('revoked', False),
+        })
+    keys.sort(key=lambda k: k.get('createdAt') or '', reverse=True)
+    return {'keys': keys}
+
+
+@https_fn.on_call(region=REGION)
+def helper_api_revoke_key(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+    prefix = (req.data.get('prefix') if req.data else None) or ''
+    if not prefix:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='prefix is required',
+        )
+    snap = db.document(f'helperApiKeys/{prefix}').get()
+    if not snap.exists:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.NOT_FOUND,
+            message='Key not found',
+        )
+    if (snap.to_dict() or {}).get('uid') != uid:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='Not your key',
+        )
+    db.document(f'helperApiKeys/{prefix}').set({'revoked': True}, merge=True)
+    return {'status': 'ok'}

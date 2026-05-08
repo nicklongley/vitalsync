@@ -94,6 +94,13 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // ── HELPER API KEYS (bearer tokens for the local helper agent) ──
+    // Only Cloud Functions (Admin SDK) read or write. Hashed secrets only;
+    // plaintext tokens never persisted.
+    match /helperApiKeys/{prefix} {
+      allow read, write: if false;
+    }
+
     // ── TRENDS ──
     match /users/{uid}/trends/{trendId} {
       allow read: if isOwner(uid);
