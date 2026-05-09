@@ -1756,11 +1756,11 @@ no preamble, no commentary. Output ONLY the sections listed below — DO NOT out
 "Current block intent", "Upcoming targets", "This week's structure" or any other
 section, even if you have data for them. Those belong to the helper.
 
-OUTPUT FORMAT (exactly these sections, in this order):
+OUTPUT FORMAT (exactly these sections, in this order — no other H2 headings,
+including no "Last updated" footer; the timestamp is exposed via API metadata):
 # Current Training Focus: {NAME}
 ## Current fitness state
 ## Recent sessions
-## Last updated: {DATE}
 
 PRINCIPLES:
 - The athlete may train across MULTIPLE sports — read their captured "sports" answer
@@ -1771,7 +1771,6 @@ PRINCIPLES:
 - "Recent sessions" — 3-6 bullet lines summarising the last week of activities.
   Include sport, duration, character (easy / threshold / VO2 / long). Skip walks
   under 30 min.
-- The "Last updated" line is required.
 - Total under 350 words. Consumed by AI assistants, not humans.
 - No fabrication. Omit a bullet rather than inventing."""
 
@@ -1784,17 +1783,16 @@ Output GitHub-flavored markdown only — no code fences around the whole documen
 preamble, no commentary. Output ONLY the section listed below — DO NOT output
 "Active focus" or "Things to watch" or any other section.
 
-OUTPUT FORMAT (exactly these sections, in this order):
+OUTPUT FORMAT (exactly these sections, in this order — no other H2 headings,
+including no "Last updated" footer; the timestamp is exposed via API metadata):
 # Current Health State: {NAME}
 ## Current trends
-## Last updated: {DATE}
 
 PRINCIPLES:
 - "Current trends" — 7-14 day direction in sleep duration, RHR, HRV, weight. Talk
   direction (improving / stable / declining) with a number or two as anchor; don't
   dump raw timeseries. Reference the athlete's captured `goodSleep` baseline when
   commenting on current sleep.
-- The "Last updated" line is required.
 - Total under 200 words.
 - No fabrication. Omit rather than invent."""
 
@@ -2545,42 +2543,61 @@ _HELPER_API_FILES = {
     'health.me':      ('health',   'me',    _run_compile_health_me),
 }
 
-# Ownership contract — see helper architecture spec.
-# 'split': VitalSync compiles only the listed sections; helper owns the rest.
-# 'helper-authoritative': VitalSync's compile is one input the helper synthesises
-# alongside other domain context. All sections returned, all marked ownedBy=vitalsync.
-_OWNERSHIP = {
+# Per-file ownership per the helper's split-ownership/v1 contract.
+# Files in _SPLIT_FILES use splitOwnership: true with header + sections array.
+# Other files use splitOwnership: false with whole-file content.
+_SPLIT_FILES = {'training_focus', 'health_focus'}
+
+# Section ID mapping per the spec — IDs are stable across title renames.
+_SECTION_IDS = {
     'training_focus': {
-        'mode': 'split',
-        'owned_titles': ['Current fitness state', 'Recent sessions'],
-    },
-    'training_me': {
-        'mode': 'helper-authoritative',
-        'owned_titles': '*',  # all sections returned as VitalSync's perspective
+        'Current fitness state': 'current-fitness-state',
+        'Recent sessions': 'recent-sessions',
     },
     'health_focus': {
-        'mode': 'split',
-        'owned_titles': ['Current trends'],
-    },
-    'health_me': {
-        'mode': 'helper-authoritative',
-        'owned_titles': '*',
+        'Current trends': 'current-trends',
     },
 }
 
+# Owner identifier for sections + headers VitalSync produces.
+_VITALSYNC_OWNER = 'VitalSync'
 
-def _filter_owned_sections(sections: dict, owned_titles) -> dict:
-    """Return only the section titles VitalSync owns.
-    For helper-authoritative files, all sections are returned (owned_titles == '*').
-    The trailing 'Last updated: ...' marker is always included since it's
-    metadata about the VitalSync compile."""
-    if owned_titles == '*':
-        return dict(sections)
-    out = {}
-    for title, body in sections.items():
-        if title in owned_titles or title.startswith('Last updated'):
-            out[title] = body
-    return out
+# Contract version per the spec — included on every file entry.
+_CONTRACT_VERSION = 'split-ownership/v1'
+
+
+def _parse_header_and_sections(content: str):
+    """Split markdown into (header_text, ordered list of (title, body)).
+    Header = everything from start of file up to (but not including) the first
+    H2 heading. Each section body excludes its '## title' line and is stripped
+    of leading/trailing blank lines.
+    """
+    if not content:
+        return ('', [])
+    header_lines = []
+    sections = []
+    current_title = None
+    current_lines = []
+    in_body = False
+    for line in content.split('\n'):
+        m = re.match(r'^##\s+(.+?)\s*$', line)
+        if m:
+            in_body = True
+            if current_title is not None:
+                sections.append((current_title, '\n'.join(current_lines).strip()))
+            current_title = m.group(1).strip()
+            current_lines = []
+        else:
+            if not in_body:
+                header_lines.append(line)
+            else:
+                current_lines.append(line)
+    if current_title is not None:
+        sections.append((current_title, '\n'.join(current_lines).strip()))
+    header = '\n'.join(header_lines).rstrip()
+    if header:
+        header += '\n'
+    return (header, sections)
 
 # Staleness thresholds for refresh=if-stale (seconds)
 _STALE_THRESHOLDS_SEC = {
@@ -2789,22 +2806,21 @@ def _build_file_entry(uid: str, file_spec: str, refresh: str, meta_only: bool) -
     elif freshness['intervals']['status'] == 'broken':
         warnings.append('intervals.icu sync has not run in over 24 hours or is not connected')
 
-    ownership_cfg = _OWNERSHIP.get(file_id, {'mode': 'helper-authoritative', 'owned_titles': '*'})
+    is_split = file_id in _SPLIT_FILES
     persisted_content = file_meta.get('content') or ''
-    parsed_sections = _markdown_sections(persisted_content)
-    owned_sections = _filter_owned_sections(parsed_sections, ownership_cfg['owned_titles'])
 
-    # sectionsChanged should reflect only owned section titles, since helper-owned
-    # sections aren't VitalSync's to diff.
-    if was_recompiled and ownership_cfg['owned_titles'] != '*':
-        sections_changed = [t for t in sections_changed if t in ownership_cfg['owned_titles']]
+    # sectionsChanged restricted to titles VitalSync owns for split files.
+    if was_recompiled and is_split:
+        owned_titles = set((_SECTION_IDS.get(file_id) or {}).keys())
+        sections_changed = [t for t in sections_changed if t in owned_titles]
 
     entry = {
         'fileId': file_id,
         'domain': domain,
         'kind': kind,
         'filename': f'{domain}.{kind}.md',
-        'ownership': ownership_cfg['mode'],
+        'splitOwnership': is_split,
+        'contractVersion': _CONTRACT_VERSION,
         'wasRecompiled': was_recompiled,
         'sectionsChanged': sections_changed,
         'freshness': freshness,
@@ -2814,14 +2830,35 @@ def _build_file_entry(uid: str, file_spec: str, refresh: str, meta_only: bool) -
         'compileSource': file_meta.get('compileSource'),
         'warnings': warnings,
     }
-    if not meta_only:
-        entry['sections'] = [
-            {'title': title, 'content': body, 'ownedBy': 'vitalsync'}
-            for title, body in owned_sections.items()
-            if not title.startswith('Last updated')  # metadata, not a content section
-        ]
-        # `content` keeps the persisted markdown for backwards-compat consumers.
-        entry['content'] = persisted_content
+    if meta_only:
+        return entry
+
+    if is_split:
+        # Split-ownership: header + sections only, NO content per spec
+        header_text, parsed = _parse_header_and_sections(persisted_content)
+        section_id_map = _SECTION_IDS.get(file_id, {})
+        owned_sections = []
+        for title, body in parsed:
+            sid = section_id_map.get(title)
+            if not sid:
+                continue  # Skip helper-owned sections or unknown titles
+            # Spec: body ends with trailing newline
+            body_with_nl = body if body.endswith('\n') else body + '\n'
+            owned_sections.append({
+                'id': sid,
+                'title': title,
+                'content': body_with_nl,
+                'ownedBy': _VITALSYNC_OWNER,
+            })
+        entry['header'] = {
+            'content': header_text or '',
+            'ownedBy': _VITALSYNC_OWNER,
+        }
+        entry['sections'] = owned_sections
+    else:
+        # Whole-file: content present, no header/sections
+        entry['content'] = persisted_content if persisted_content else None
+
     return entry
 
 
