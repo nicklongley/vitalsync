@@ -1746,60 +1746,56 @@ medical conditions. If asked about concerning symptoms, recommend consulting a d
 # users/{uid}/aiContext/{fileId}.
 # ══════════════════════════════════════════════════════
 
-TRAINING_FOCUS_PROMPT = """You compile a personal `training.focus.md` file capturing the
-athlete's CURRENT training state. Output GitHub-flavored markdown only — no code fences
-around the whole document, no preamble, no commentary. Follow the EXACT section structure.
+TRAINING_FOCUS_PROMPT = """You compile the VitalSync-owned portion of `training.focus.md`.
+Under the helper architecture, this file is split-ownership: VitalSync owns the
+metric-grounded sections; the helper-side agent owns interpretive sections (block
+intent, upcoming targets, week structure) using its broader cross-domain context.
 
-OUTPUT FORMAT:
+Output GitHub-flavored markdown only — no code fences around the whole document,
+no preamble, no commentary. Output ONLY the sections listed below — DO NOT output
+"Current block intent", "Upcoming targets", "This week's structure" or any other
+section, even if you have data for them. Those belong to the helper.
+
+OUTPUT FORMAT (exactly these sections, in this order):
 # Current Training Focus: {NAME}
 ## Current fitness state
-## Current block intent
 ## Recent sessions
-## Upcoming targets
-## This week's structure
 ## Last updated: {DATE}
 
 PRINCIPLES:
-- The athlete may train across MULTIPLE sports — read their captured "sports" answer and
-  treat the file as plural-sport unless they stated otherwise. Do not default to cycling.
-- "Current fitness state" — short narrative on CTL (Fitness), ATL (Fatigue), Form (TSB),
-  FTP if known, weight; what those numbers mean RIGHT NOW (fresh / accumulating fatigue /
-  peak / detrained). 2-3 sentences max.
-- "Current block intent" — what kind of work the athlete is doing this block, inferred
-  from the recent session pattern PLUS their stated current target. 1-2 sentences.
-- "Recent sessions" — 3-6 bullet lines summarising the last week of activities. Include
-  sport, duration, character (easy / threshold / VO2 / long). Skip walks under 30min.
-- "Upcoming targets" — events / goals from captured `currentTarget` and `longArcGoals`,
-  with rough time horizon. If none, say "General fitness — no specific event."
-- "This week's structure" — realistic week shape given the captured `lifePatterns`,
-  `timeBudget`, and `workArounds`. Reference solo-parent days, work travel, etc. when
-  relevant. Keep concrete (e.g. "Mon strength, Tue rest, Wed turbo, ...") rather than
-  abstract.
-- Total under 700 words. The file is consumed by AI assistants, not humans.
-- No fabrication. If a data point is missing, omit it rather than inventing."""
+- The athlete may train across MULTIPLE sports — read their captured "sports" answer
+  and treat the file as plural-sport. Do not default to cycling unless they said so.
+- "Current fitness state" — short narrative on CTL (Fitness), ATL (Fatigue), Form
+  (TSB), FTP if known, weight; what those numbers mean RIGHT NOW (fresh /
+  accumulating fatigue / peak / detrained). 2-3 sentences max.
+- "Recent sessions" — 3-6 bullet lines summarising the last week of activities.
+  Include sport, duration, character (easy / threshold / VO2 / long). Skip walks
+  under 30 min.
+- The "Last updated" line is required.
+- Total under 350 words. Consumed by AI assistants, not humans.
+- No fabrication. Omit a bullet rather than inventing."""
 
-HEALTH_FOCUS_PROMPT = """You compile a personal `health.focus.md` file capturing the
-athlete's CURRENT health state. Output GitHub-flavored markdown only — no code fences
-around the whole document, no preamble, no commentary. Follow the EXACT section structure.
+HEALTH_FOCUS_PROMPT = """You compile the VitalSync-owned portion of `health.focus.md`.
+Under the helper architecture, this file is split-ownership: VitalSync owns the
+metric-trend section; the helper-side agent owns interpretive sections (active focus,
+things to watch) using its broader cross-domain context.
 
-OUTPUT FORMAT:
+Output GitHub-flavored markdown only — no code fences around the whole document, no
+preamble, no commentary. Output ONLY the section listed below — DO NOT output
+"Active focus" or "Things to watch" or any other section.
+
+OUTPUT FORMAT (exactly these sections, in this order):
 # Current Health State: {NAME}
 ## Current trends
-## Active focus
-## Things to watch
 ## Last updated: {DATE}
 
 PRINCIPLES:
 - "Current trends" — 7-14 day direction in sleep duration, RHR, HRV, weight. Talk
-  direction (improving / stable / declining) with a number or two for anchor; don't
+  direction (improving / stable / declining) with a number or two as anchor; don't
   dump raw timeseries. Reference the athlete's captured `goodSleep` baseline when
   commenting on current sleep.
-- "Active focus" — what the athlete is currently testing or watching, taken from
-  captured `activeConcerns` and `sleepSituation`.
-- "Things to watch" — concrete signals to flag if they trip: e.g. "RHR creeping above
-  baseline 5+ days," "HRV declining a week," "weight drift outside usual range."
-  Tie these to the athlete's stated `recoveryFactors` and `healthHistory` where possible.
-- Total under 500 words.
+- The "Last updated" line is required.
+- Total under 200 words.
 - No fabrication. Omit rather than invent."""
 
 
@@ -2549,6 +2545,43 @@ _HELPER_API_FILES = {
     'health.me':      ('health',   'me',    _run_compile_health_me),
 }
 
+# Ownership contract — see helper architecture spec.
+# 'split': VitalSync compiles only the listed sections; helper owns the rest.
+# 'helper-authoritative': VitalSync's compile is one input the helper synthesises
+# alongside other domain context. All sections returned, all marked ownedBy=vitalsync.
+_OWNERSHIP = {
+    'training_focus': {
+        'mode': 'split',
+        'owned_titles': ['Current fitness state', 'Recent sessions'],
+    },
+    'training_me': {
+        'mode': 'helper-authoritative',
+        'owned_titles': '*',  # all sections returned as VitalSync's perspective
+    },
+    'health_focus': {
+        'mode': 'split',
+        'owned_titles': ['Current trends'],
+    },
+    'health_me': {
+        'mode': 'helper-authoritative',
+        'owned_titles': '*',
+    },
+}
+
+
+def _filter_owned_sections(sections: dict, owned_titles) -> dict:
+    """Return only the section titles VitalSync owns.
+    For helper-authoritative files, all sections are returned (owned_titles == '*').
+    The trailing 'Last updated: ...' marker is always included since it's
+    metadata about the VitalSync compile."""
+    if owned_titles == '*':
+        return dict(sections)
+    out = {}
+    for title, body in sections.items():
+        if title in owned_titles or title.startswith('Last updated'):
+            out[title] = body
+    return out
+
 # Staleness thresholds for refresh=if-stale (seconds)
 _STALE_THRESHOLDS_SEC = {
     'focus': 6 * 3600,   # 6h for focus files
@@ -2756,11 +2789,22 @@ def _build_file_entry(uid: str, file_spec: str, refresh: str, meta_only: bool) -
     elif freshness['intervals']['status'] == 'broken':
         warnings.append('intervals.icu sync has not run in over 24 hours or is not connected')
 
+    ownership_cfg = _OWNERSHIP.get(file_id, {'mode': 'helper-authoritative', 'owned_titles': '*'})
+    persisted_content = file_meta.get('content') or ''
+    parsed_sections = _markdown_sections(persisted_content)
+    owned_sections = _filter_owned_sections(parsed_sections, ownership_cfg['owned_titles'])
+
+    # sectionsChanged should reflect only owned section titles, since helper-owned
+    # sections aren't VitalSync's to diff.
+    if was_recompiled and ownership_cfg['owned_titles'] != '*':
+        sections_changed = [t for t in sections_changed if t in ownership_cfg['owned_titles']]
+
     entry = {
         'fileId': file_id,
         'domain': domain,
         'kind': kind,
         'filename': f'{domain}.{kind}.md',
+        'ownership': ownership_cfg['mode'],
         'wasRecompiled': was_recompiled,
         'sectionsChanged': sections_changed,
         'freshness': freshness,
@@ -2771,7 +2815,13 @@ def _build_file_entry(uid: str, file_spec: str, refresh: str, meta_only: bool) -
         'warnings': warnings,
     }
     if not meta_only:
-        entry['content'] = file_meta.get('content')
+        entry['sections'] = [
+            {'title': title, 'content': body, 'ownedBy': 'vitalsync'}
+            for title, body in owned_sections.items()
+            if not title.startswith('Last updated')  # metadata, not a content section
+        ]
+        # `content` keeps the persisted markdown for backwards-compat consumers.
+        entry['content'] = persisted_content
     return entry
 
 

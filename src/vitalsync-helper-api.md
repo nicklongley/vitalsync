@@ -369,3 +369,8 @@ successor lands.
 - Section diff is title-list only; full text-level diff is not returned. The
   helper computes line-level diff locally if needed.
 - ZDR is not yet enabled at the Anthropic project level.
+- No file-level ownership preamble emitted in `content`. Ownership is signalled
+  per-section via `ownership` + `sections[].ownedBy`.
+- For `ownership: split` files, the persisted `content` field reflects only
+  VitalSync's compiled portion and is NOT a complete file — the helper must
+  merge with its own sections to form the authoritative version.
