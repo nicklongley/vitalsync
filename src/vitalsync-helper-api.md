@@ -37,16 +37,25 @@ other Firestore collection.
 
 ## Files exposed
 
-Four files, addressed by `<domain>.<kind>`:
+Four files, addressed by `<domain>.<kind>`. Two are **split-ownership** (VitalSync
+owns the metric-grounded sections; the helper owns interpretive sections), two are
+**helper-authoritative** (the helper writes the canonical file in the helper folder;
+VitalSync's compile is one input the helper synthesises alongside other domain
+context).
 
-| Spec | Domain | Kind | Default cadence | Section structure |
-|---|---|---|---|---|
-| `training.focus` | training | focus | weekly | Current Training Focus → Current fitness state, Current block intent, Recent sessions, Upcoming targets, This week's structure |
-| `training.me` | training | me | quarterly | Training Identity → What kind of athlete I am, Physiological baseline, Long-arc goals, Training constraints, How I respond to training, Why I do this |
-| `health.focus` | health | focus | weekly | Current Health State → Current trends, Active focus, Things to watch |
-| `health.me` | health | me | quarterly | Health Identity → Baseline metrics, Sleep patterns, Recovery patterns, Long-arc health priorities |
+| Spec | Ownership | VitalSync-owned sections | Helper-owned sections |
+|---|---|---|---|
+| `training.focus` | split | Current fitness state, Recent sessions | Current block intent, Upcoming targets, This week's structure |
+| `training.me` | helper-authoritative | (whole VitalSync compile, as input) | helper writes the authoritative file |
+| `health.focus` | split | Current trends | Active focus, Things to watch |
+| `health.me` | helper-authoritative | (whole VitalSync compile, as input) | helper writes the authoritative file |
 
-Each file ends with `## Last updated: YYYY-MM-DD`.
+VitalSync compiles only the sections it owns for split files. For helper-authoritative
+files, VitalSync compiles the full set of identity sections and the helper treats
+them as input to its own synthesis.
+
+Each compile ends with `## Last updated: YYYY-MM-DD` as a metadata marker — exposed
+via the `generatedAt` response field, not as a content section.
 
 ## Endpoints
 
@@ -86,13 +95,18 @@ Batched read of one or more files. Default: cache-only (no LLM call).
       "domain": "training",
       "kind": "focus",
       "filename": "training.focus.md",
+      "ownership": "split",
+      "sections": [
+        { "title": "Current fitness state", "content": "...", "ownedBy": "vitalsync" },
+        { "title": "Recent sessions",        "content": "...", "ownedBy": "vitalsync" }
+      ],
       "content": "# Current Training Focus: Nick\n## Current fitness state\n...",
       "generatedAt": "2026-05-08T08:14:21Z",
       "editedAt": null,
       "generatedBy": "claude-sonnet-4-5-20250929",
       "compileSource": "api",
       "wasRecompiled": true,
-      "sectionsChanged": ["Current fitness state", "This week's structure"],
+      "sectionsChanged": ["Current fitness state"],
       "freshness": {
         "intervals": {
           "lastSyncedAt": "2026-05-08T08:12:03Z",
@@ -117,18 +131,58 @@ Batched read of one or more files. Default: cache-only (no LLM call).
 | `domain` | string | `training` \| `health` |
 | `kind` | string | `focus` \| `me` |
 | `filename` | string | `<domain>.<kind>.md`, suitable as a save target |
-| `content` | string \| null | Full markdown. Omitted when `meta_only=true`. Null if never compiled |
+| `ownership` | `split` \| `helper-authoritative` | See ownership contract below |
+| `sections` | array | Per-section structured payload. Omitted when `meta_only=true`. See `sections` reference below |
+| `content` | string \| null | Full persisted markdown VitalSync produced. Convenience field for clients that don't use `sections`. Omitted when `meta_only=true`. Null if never compiled. For split-ownership files, this is *only* the VitalSync portion — not a complete file |
 | `generatedAt` | ISO 8601 UTC \| null | When the persisted file was last compiled |
 | `editedAt` | ISO 8601 UTC \| null | When the persisted file was last hand-edited via the web UI |
 | `generatedBy` | string | Anthropic model ID used for the last compile |
 | `compileSource` | `api` \| `ui` | Which surface last touched the persisted version |
 | `wasRecompiled` | bool | True if this request triggered a fresh compile |
-| `sectionsChanged` | array<string> | H2 section titles whose body text differs from the previous compilation. Populated only when `wasRecompiled=true` |
+| `sectionsChanged` | array<string> | VitalSync-owned section titles whose body differs from the previous compilation. Populated only when `wasRecompiled=true`. Helper-owned sections are never reported here — VitalSync doesn't produce them |
 | `freshness.intervals.lastSyncedAt` | ISO 8601 UTC \| null | When intervals.icu sync last ran |
 | `freshness.intervals.ageMinutes` | int \| null | Minutes since `lastSyncedAt` |
 | `freshness.intervals.status` | `fresh` \| `stale` \| `broken` | `fresh` ≤ 6 h, `stale` 6–24 h, `broken` > 24 h or not connected |
 | `freshness.captureAnswers.lastUpdatedAt` | ISO 8601 UTC \| null | Most recent answer save in the domain |
 | `warnings` | array<string> | Human-readable advisories worth surfacing to the user |
+
+#### `sections` reference
+
+Each entry:
+
+| Field | Type | Notes |
+|---|---|---|
+| `title` | string | The H2 section title from the spec (e.g. `"Current fitness state"`). Does NOT include the `## ` prefix |
+| `content` | string | The body of that section in markdown. Does NOT include the `## <title>` header line |
+| `ownedBy` | `vitalsync` | Always `vitalsync` — the API only returns sections VitalSync owns or contributes |
+
+Notes:
+
+- For `ownership: split` files, `sections` contains only the VitalSync-owned
+  sections. The helper merges these with its own helper-owned sections to form the
+  authoritative file in the helper folder.
+- For `ownership: helper-authoritative` files, `sections` contains the full set of
+  sections VitalSync compiled — these are VitalSync's *perspective* on the durable
+  identity, intended as input to the helper's synthesis with career/work/cross-domain
+  context. The helper writes the canonical file; VitalSync does not.
+- The trailing `## Last updated: ...` marker is metadata. It is NOT included as a
+  `sections[]` entry — the timestamp is exposed via `generatedAt`.
+
+#### Ownership contract
+
+Per-section, no file-level preamble. The helper merges based on `ownership` and the
+`sections` returned. Helper-owned sections are unknown to VitalSync; do not infer
+them from this API.
+
+| File | Ownership | What VitalSync returns in `sections` |
+|---|---|---|
+| `training.focus` | split | `Current fitness state`, `Recent sessions` |
+| `training.me` | helper-authoritative | full VitalSync compile (`What kind of athlete I am`, `Physiological baseline`, `Long-arc goals`, `Training constraints`, `How I respond to training`, `Why I do this`) — as VitalSync's perspective |
+| `health.focus` | split | `Current trends` |
+| `health.me` | helper-authoritative | full VitalSync compile (`Baseline metrics`, `Sleep patterns`, `Recovery patterns`, `Long-arc health priorities`) |
+
+No file-level `<!-- source-system-owned -->` preamble is emitted in `content`.
+Ownership lives at the section level.
 
 #### Per-file errors inside a 200 response
 
