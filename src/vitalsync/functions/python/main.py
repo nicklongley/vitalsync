@@ -1789,12 +1789,25 @@ including no "Last updated" footer; the timestamp is exposed via API metadata):
 ## Current trends
 
 PRINCIPLES:
-- "Current trends" — 7-14 day direction in sleep duration, RHR, HRV, weight. Talk
-  direction (improving / stable / declining) with a number or two as anchor; don't
-  dump raw timeseries. Reference the athlete's captured `goodSleep` baseline when
-  commenting on current sleep.
-- Total under 200 words.
-- No fabrication. Omit rather than invent."""
+- "Current trends" — 7-14 day direction in sleep duration, RHR, HRV, weight, AND
+  any of these that are present in `healthLogLast14Days`:
+  - Blood pressure (systolic/diastolic) — direction + most recent reading.
+  - Mood and energy (1-5 scale) — direction and current.
+  - Manually-logged weight + waist circumference — use these as authoritative
+    where they exist; intervals.icu `weightFromIntervals` is a fallback only.
+  - Glucose readings if logged (with `timing` like fasting / post-meal).
+  - Cholesterol panel if logged recently.
+  - Body fat % if logged.
+  Talk direction (improving / stable / declining) with a number or two as anchor;
+  don't dump raw timeseries.
+- IMPORTANT — weight: when `healthLogLast14Days` contains weight entries, treat
+  those as the user-confirmed truth. Intervals.icu often has stale or
+  inconsistent weight readings. If manual entries disagree with intervals
+  readings, trust the manual entries and call out the discrepancy briefly.
+- Reference the athlete's captured `goodSleep` baseline when commenting on sleep.
+- Total under 250 words.
+- No fabrication. Omit a metric rather than invent. If a logged metric is sparse
+  (1-2 readings in 14 days), say so — direction needs ≥3 points to claim."""
 
 
 def _capture_for(uid: str, domain: str) -> dict:
@@ -2105,6 +2118,96 @@ def _wellness_summary(uid: str, days: int = 60) -> dict:
     }
 
 
+def _recent_healthlog(uid: str, days: int = 14) -> list:
+    """Recent healthLog entries (manually-logged BP, mood, weight, glucose,
+    cholesterol, notes etc.), newest first, trimmed per entry type so the
+    payload stays compact for the prompt.
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    q = (
+        db.collection(f'users/{uid}/healthLog')
+        .order_by('date', direction='DESCENDING')
+        .limit(300)
+    )
+    out = []
+    for snap in q.stream():
+        d = snap.to_dict() or {}
+        if (d.get('date') or '') < cutoff:
+            continue
+        t = d.get('type')
+        entry = {'type': t, 'date': d.get('date')}
+        if t == 'weight':
+            if d.get('value'): entry['weightKg'] = d['value']
+            if d.get('waistCm'): entry['waistCm'] = d['waistCm']
+            if d.get('bodyFat'): entry['bodyFatPct'] = d['bodyFat']
+        elif t == 'blood_pressure':
+            if d.get('systolic'): entry['systolic'] = d['systolic']
+            if d.get('diastolic'): entry['diastolic'] = d['diastolic']
+            if d.get('heartRate'): entry['heartRate'] = d['heartRate']
+        elif t == 'glucose':
+            if d.get('value') is not None: entry['mmolPerL'] = d['value']
+            if d.get('timing'): entry['timing'] = d['timing']
+        elif t == 'cholesterol':
+            for f in ('totalCholesterol', 'hdl', 'ldl', 'triglycerides'):
+                if d.get(f) is not None: entry[f] = d[f]
+        elif t == 'mood':
+            if d.get('mood'): entry['mood'] = d['mood']
+            if d.get('energy'): entry['energy'] = d['energy']
+            if d.get('notes'): entry['notes'] = d['notes']
+        elif t == 'notes':
+            if d.get('text'): entry['text'] = d['text']
+        out.append(entry)
+    return out
+
+
+def _health_log_summary(uid: str, days: int = 60) -> dict:
+    """Aggregated ranges across a window of healthLog entries for me-file synthesis."""
+    entries = _recent_healthlog(uid, days=days)
+
+    def _stats(vals):
+        if not vals:
+            return None
+        return {
+            'min': min(vals), 'max': max(vals),
+            'avg': round(sum(vals) / len(vals), 1),
+            'samples': len(vals),
+        }
+
+    bp_sys = [e['systolic'] for e in entries if e['type'] == 'blood_pressure' and e.get('systolic')]
+    bp_dia = [e['diastolic'] for e in entries if e['type'] == 'blood_pressure' and e.get('diastolic')]
+    bp_hr = [e['heartRate'] for e in entries if e['type'] == 'blood_pressure' and e.get('heartRate')]
+    moods = [e['mood'] for e in entries if e['type'] == 'mood' and e.get('mood')]
+    energies = [e['energy'] for e in entries if e['type'] == 'mood' and e.get('energy')]
+    weights_manual = [e['weightKg'] for e in entries if e['type'] == 'weight' and e.get('weightKg')]
+    waists = [e['waistCm'] for e in entries if e['type'] == 'weight' and e.get('waistCm')]
+    body_fats = [e['bodyFatPct'] for e in entries if e['type'] == 'weight' and e.get('bodyFatPct')]
+    glucoses = [e['mmolPerL'] for e in entries if e['type'] == 'glucose' and e.get('mmolPerL') is not None]
+    cholesterol_recent = [e for e in entries if e['type'] == 'cholesterol'][:3]
+    free_notes = [
+        {'date': e.get('date'), 'text': e.get('notes') or e.get('text')}
+        for e in entries
+        if (e['type'] == 'mood' and e.get('notes')) or (e['type'] == 'notes' and e.get('text'))
+    ][:10]
+
+    return {
+        'windowDays': days,
+        'bloodPressure': {
+            'systolic': _stats(bp_sys),
+            'diastolic': _stats(bp_dia),
+            'heartRate': _stats(bp_hr),
+        } if bp_sys or bp_dia else None,
+        'mood': _stats(moods),
+        'energy': _stats(energies),
+        'weightManual': _stats(weights_manual),
+        'waistCm': _stats(waists),
+        'bodyFatPct': _stats(body_fats),
+        'glucose': _stats(glucoses),
+        'recentCholesterol': cholesterol_recent,
+        'recentNotes': free_notes,
+    }
+
+
+
 TRAINING_ME_PROMPT = """You compile a personal `training.me.md` file capturing the athlete's
 DURABLE training identity — what kind of athlete they are, slow-moving truths that change
 quarterly at most. Output GitHub-flavored markdown only. No code fences around the whole
@@ -2156,16 +2259,37 @@ OUTPUT FORMAT:
 
 PRINCIPLES:
 - This file changes QUARTERLY at most.
-- "Baseline metrics" — RHR range, HRV baseline (rMSSD or SDNN), weight range, sleep score
-  range. Use the wellnessSummary stats. Talk ranges (e.g. "RHR baseline 48-54bpm") rather
-  than single readings.
-- "Sleep patterns" — captured `goodSleep` is primary. Augment with average sleep hours and
-  sleep score from wellnessSummary. Describe what good sleep looks like for THIS person.
-- "Recovery patterns" — captured `sleepResponse` and `recoveryFactors`. How they respond
-  to poor sleep, what affects their recovery.
-- "Long-arc health priorities" — captured `longArcHealth`. 2-3 priorities, concrete.
+- "Baseline metrics" — pull ALL of these from `wellnessSummary` and
+  `healthLogSummary` (manual entries from the user's HealthLog):
+  - RHR range (wellnessSummary.restingHR)
+  - HRV baseline rMSSD/SDNN (wellnessSummary.hrv)
+  - Sleep score range (wellnessSummary.sleepScore)
+  - Weight range — prefer healthLogSummary.weightManual when present (user-
+    confirmed), otherwise wellnessSummary.weight (intervals.icu)
+  - Waist circumference range (healthLogSummary.waistCm)
+  - Body fat % range (healthLogSummary.bodyFatPct)
+  - Blood pressure baseline (healthLogSummary.bloodPressure — systolic/diastolic
+    avg/range, with sample count if low)
+  - Glucose baseline (healthLogSummary.glucose) if logged
+  - Cholesterol baseline (healthLogSummary.recentCholesterol) — total / HDL /
+    LDL / triglycerides; latest reading
+  - Mood and energy average and range (healthLogSummary.mood / .energy) — only
+    if there are enough samples to be meaningful (≥5)
+  Talk ranges (e.g. "RHR baseline 48-54bpm") rather than single readings. Omit
+  any metric with no data; do not invent placeholders.
+- IMPORTANT — for weight, body fat, waist: manual entries from healthLogSummary
+  are authoritative. intervals.icu's weight is fallback only.
+- "Sleep patterns" — captured `goodSleep` is primary. Augment with average sleep
+  hours and sleep score from wellnessSummary.
+- "Recovery patterns" — captured `sleepResponse` and `recoveryFactors`. How they
+  respond to poor sleep, what affects recovery. Reference the mood/energy
+  pattern from healthLogSummary if present (e.g. "energy averages 3.5/5 with
+  dips correlated to ...").
+- "Long-arc health priorities" — captured `longArcHealth`. 2-3 priorities,
+  concrete.
 - Total under 1200 words.
-- No fabrication. If a captured field is empty, omit or say "Not yet captured."
+- No fabrication. If a captured or logged field is empty, omit or say "Not yet
+  captured."
 - If `previousFile` is provided, refine rather than rewrite."""
 
 
@@ -2258,6 +2382,7 @@ def _run_compile_health_me(uid: str, source: str = 'ui') -> dict:
         },
         'capturedContext': capture,
         'wellnessSummary': wellness_summary,
+        'healthLogSummary': _health_log_summary(uid, days=60),
         'previousFile': previous_content,
     }
 
@@ -2295,6 +2420,7 @@ def _run_compile_health_focus(uid: str, source: str = 'ui') -> dict:
     today_iso = date.today().isoformat()
     capture = _capture_for(uid, 'health')
     wellness_recent = _recent_wellness(uid, days=14)
+    health_log_recent = _recent_healthlog(uid, days=14)
 
     trimmed = []
     for w in wellness_recent:
@@ -2304,7 +2430,7 @@ def _run_compile_health_focus(uid: str, source: str = 'ui') -> dict:
             'sleepScore': w.get('sleepScore'),
             'restingHR': w.get('restingHR'),
             'hrv': w.get('hrv') or w.get('hrvSDNN'),
-            'weight': w.get('weight'),
+            'weightFromIntervals': w.get('weight'),
         })
 
     payload = {
@@ -2312,6 +2438,7 @@ def _run_compile_health_focus(uid: str, source: str = 'ui') -> dict:
         'today': today_iso,
         'capturedContext': capture,
         'wellnessLast14Days': trimmed,
+        'healthLogLast14Days': health_log_recent,
     }
 
     client = _get_anthropic_client()
