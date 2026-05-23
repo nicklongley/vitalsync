@@ -384,6 +384,66 @@ def _resume_start_date(uid: str) -> str:
     return (date.today() - timedelta(days=30)).isoformat()
 
 
+_CONCURRENT_START_WINDOW = timedelta(minutes=10)
+
+
+def _dedup_concurrent_activities(activities: list) -> tuple[list, list]:
+    """Group activities whose start times are within 10 minutes and keep the longest.
+
+    intervals.icu syncs both the user's Garmin watch and Hammerhead Karoo, so the same
+    ride often appears twice — sometimes with one started a few minutes after the
+    other, or split into two recordings. The user can't run two sessions at once, so
+    any pair starting within 10 minutes is treated as the same session.
+
+    Returns (winners, losers) as lists of the original activity dicts.
+    """
+    if not activities:
+        return [], []
+
+    items = []
+    for a in activities:
+        start_str = a.get('start_date')
+        elapsed = a.get('elapsed_time') or a.get('icu_duration') or 0
+        start = None
+        if start_str:
+            try:
+                start = datetime.fromisoformat(str(start_str).replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                start = None
+        items.append({'act': a, 'start': start, 'elapsed': elapsed})
+
+    items.sort(key=lambda it: (it['start'] is None, it['start'] or datetime.max.replace(tzinfo=None)))
+
+    groups: list[list[dict]] = []
+    for it in items:
+        if it['start'] is None:
+            groups.append([it])
+            continue
+        merged = False
+        for g in groups:
+            for member in g:
+                if member['start'] is None:
+                    continue
+                if abs(it['start'] - member['start']) <= _CONCURRENT_START_WINDOW:
+                    g.append(it)
+                    merged = True
+                    break
+            if merged:
+                break
+        if not merged:
+            groups.append([it])
+
+    winners, losers = [], []
+    for g in groups:
+        if len(g) == 1:
+            winners.append(g[0]['act'])
+            continue
+        winner = max(g, key=lambda x: x['elapsed'])
+        for member in g:
+            (winners if member is winner else losers).append(member['act'])
+    return winners, losers
+
+
 def _do_intervals_sync(uid: str, api_key: str, start_date: str, end_date: str = None):
     """Pull wellness + activities for a date range and upsert to Firestore."""
     if not end_date:
@@ -447,9 +507,13 @@ def _do_intervals_sync(uid: str, api_key: str, start_date: str, end_date: str = 
         default=[],
     ) or []
 
+    winners, losers = _dedup_concurrent_activities(activities)
+    if losers:
+        print(f'intervals dedup {uid}: kept {len(winners)}, dropped {len(losers)} concurrent')
+
     batch = db.batch()
     write_count = 0
-    for act in activities:
+    for act in winners:
         act_id = act.get('id')
         if not act_id:
             continue
@@ -470,9 +534,26 @@ def _do_intervals_sync(uid: str, api_key: str, start_date: str, end_date: str = 
     if write_count > 0:
         batch.commit()
 
+    # Delete any previously-written loser docs so the historical view stays clean
+    if losers:
+        batch = db.batch()
+        del_count = 0
+        for act in losers:
+            act_id = act.get('id')
+            if not act_id:
+                continue
+            batch.delete(db.document(f'users/{uid}/activities/intervals_{act_id}'))
+            del_count += 1
+            if del_count >= 450:
+                batch.commit()
+                batch = db.batch()
+                del_count = 0
+        if del_count > 0:
+            batch.commit()
+
     # Mark plan sessions complete when activities pair with our pushed events
     try:
-        _sync_plan_completion(uid, activities)
+        _sync_plan_completion(uid, winners)
     except Exception as e:
         print(f'Plan completion sync failed for {uid}: {e}')
 
@@ -484,8 +565,8 @@ def _do_intervals_sync(uid: str, api_key: str, start_date: str, end_date: str = 
     except Exception as e:
         print(f'Athlete profile refresh failed for {uid}: {e}')
 
-    print(f'intervals sync done {uid}: {len(wellness)} wellness, {len(activities)} activities')
-    return {'wellness': len(wellness), 'activities': len(activities)}
+    print(f'intervals sync done {uid}: {len(wellness)} wellness, {len(winners)} activities ({len(losers)} deduped)')
+    return {'wellness': len(wellness), 'activities': len(winners), 'deduped': len(losers)}
 
 
 # ══════════════════════════════════════════════════════
@@ -751,6 +832,63 @@ def intervals_backfill(req: https_fn.CallableRequest) -> dict:
         'status': 'ok',
         'totalWellness': total_w,
         'totalActivities': total_a,
+    }
+
+
+# ══════════════════════════════════════════════════════
+# CLEANUP — one-shot dedup of historical concurrent activities
+# ══════════════════════════════════════════════════════
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=540,
+)
+def intervals_cleanup_overlapping(req: https_fn.CallableRequest) -> dict:
+    """Walk the user's full activities collection and delete concurrent duplicates,
+    keeping the longest in each cluster. Same heuristic as live sync (start times
+    within 10 minutes = same session)."""
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    candidates = []
+    for doc in db.collection(f'users/{uid}/activities').stream():
+        data = doc.to_dict() or {}
+        intervals_id = data.get('intervalsId')
+        if not intervals_id:
+            continue
+        candidates.append({
+            'id': intervals_id,
+            'start_date': data.get('startTimeGMT'),
+            'elapsed_time': data.get('duration'),
+        })
+
+    _, losers = _dedup_concurrent_activities(candidates)
+
+    batch = db.batch()
+    count = 0
+    deleted_ids = []
+    for act in losers:
+        ref = db.document(f"users/{uid}/activities/intervals_{act['id']}")
+        batch.delete(ref)
+        deleted_ids.append(act['id'])
+        count += 1
+        if count >= 450:
+            batch.commit()
+            batch = db.batch()
+            count = 0
+    if count > 0:
+        batch.commit()
+
+    print(f'intervals cleanup {uid}: scanned {len(candidates)}, deleted {len(deleted_ids)}')
+    return {
+        'scanned': len(candidates),
+        'deleted': len(deleted_ids),
+        'deletedIds': deleted_ids,
     }
 
 
