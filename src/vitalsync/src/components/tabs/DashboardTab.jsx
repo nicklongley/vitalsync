@@ -13,7 +13,7 @@ import { db } from '@/lib/firebase';
 import { useTodayWellness, useWeekWellness, useIntervalsSync, useRecentActivities, useHealthLog } from '@/hooks/useIntervalsData';
 import { useAuth } from '@/contexts/AuthContext';
 import { useNavigation } from '@/contexts/NavigationContext';
-import { GaugeRing, MetricCard, ActionPrompt, InterventionCard } from '@/components/shared';
+import { GaugeRing, MetricCard, ActionPrompt, InterventionCard, classifyWkg } from '@/components/shared';
 import SyncProgress from '@/components/SyncProgress';
 import ActivityDetail from '@/components/ActivityDetail';
 
@@ -206,6 +206,10 @@ export default function DashboardTab() {
   const firstName = user?.displayName?.split(' ')[0] || 'Athlete';
 
   const currentWeight = todayWeight || profileWeight || 0;
+  const profileFtp = userSettings?.profile?.ftp || 0;
+  const profileGender = userSettings?.profile?.gender || 'male';
+  const currentWkg = profileFtp && currentWeight ? Math.round((profileFtp / currentWeight) * 100) / 100 : 0;
+  const currentTier = currentWkg > 0 ? classifyWkg(currentWkg, profileGender) : null;
   const activeDisplay = weekTotals.minutes >= 60
     ? { value: (weekTotals.minutes / 60).toFixed(1), unit: 'h' }
     : { value: weekTotals.minutes || 0, unit: 'min' };
@@ -299,6 +303,23 @@ export default function DashboardTab() {
           value={atl || '--'}
           subtitle={ctl ? `Fitness: ${ctl}` : ''}
         />
+        <MetricCard
+          icon={"⚡"}
+          title="Power"
+          value={currentWkg ? currentWkg.toFixed(2) : '--'}
+          unit={currentWkg ? 'W/kg' : ''}
+          subtitle={profileFtp ? `FTP ${profileFtp}w · ${currentWeight ? currentWeight.toFixed(1) : '--'} kg` : 'Set FTP + weight'}
+        >
+          {currentTier && (
+            <p
+              className="text-[10px] font-semibold mt-2"
+              style={{ color: currentTier.color }}
+            >
+              {currentTier.cat}
+              <span className="text-slate-500 font-normal ml-1">{currentTier.percentile}</span>
+            </p>
+          )}
+        </MetricCard>
         <MetricCard
           icon={"⏱️"}
           title="Active This Week"

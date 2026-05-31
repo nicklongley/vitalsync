@@ -474,8 +474,8 @@ function RidesView({ rides }) {
 
             {/* Power metrics row */}
             <div className="grid grid-cols-4 gap-2">
-              <MiniStat label="NP" value={np ? `${Math.round(np)}w` : '--'} />
-              <MiniStat label="Avg" value={avgP ? `${Math.round(avgP)}w` : '--'} />
+              <MiniStat label="NP" value={np ? `${Math.round(np)}w` : '--'} sub={ride.npWkg ? `${ride.npWkg.toFixed(2)} W/kg` : null} />
+              <MiniStat label="Avg" value={avgP ? `${Math.round(avgP)}w` : '--'} sub={ride.avgWkg ? `${ride.avgWkg.toFixed(2)} W/kg` : null} />
               <MiniStat label="IF" value={ifVal ? ifVal.toFixed(2) : '--'} />
               <MiniStat label="Cal" value={cal ? cal.toLocaleString() : '--'} />
             </div>
@@ -506,13 +506,14 @@ function RidesView({ rides }) {
 }
 
 // ── Mini stat cell for ride cards ──
-function MiniStat({ label, value, unit }) {
+function MiniStat({ label, value, unit, sub }) {
   return (
     <div>
       <p className="text-[10px] text-slate-500">{label}</p>
       <p className="text-sm font-mono font-bold text-white">
         {value}{unit && <span className="text-[9px] text-slate-500 ml-0.5">{unit}</span>}
       </p>
+      {sub && <p className="text-[9px] text-cyan-400 font-mono mt-0.5">{sub}</p>}
     </div>
   );
 }

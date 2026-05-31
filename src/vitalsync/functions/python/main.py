@@ -216,6 +216,17 @@ def _map_intervals_activity(act: dict) -> dict:
         calories = int(act['icu_joules'] / 4184)
     else:
         calories = None
+
+    avg_p = _first(act.get('average_watts'), act.get('icu_average_watts'), act.get('avgPower'))
+    np = _first(act.get('icu_weighted_avg_watts'), act.get('weighted_average_watts'))
+    max_p = _first(act.get('max_watts'), act.get('maxPower'))
+    weight_at_time = act.get('icu_weight')
+
+    def _wkg(power):
+        if not power or not weight_at_time or weight_at_time <= 0:
+            return None
+        return round(float(power) / float(weight_at_time), 2)
+
     return {
         'activityId': f'intervals_{act_id}',
         'intervalsId': act_id,
@@ -231,9 +242,9 @@ def _map_intervals_activity(act: dict) -> dict:
         'calories': calories,
         'averageHR': _first(act.get('average_heartrate'), act.get('avgHr'), act.get('icu_average_heartrate')),
         'maxHR': _first(act.get('max_heartrate'), act.get('maxHr')),
-        'averagePower': _first(act.get('average_watts'), act.get('icu_average_watts'), act.get('avgPower')),
-        'normalizedPower': _first(act.get('icu_weighted_avg_watts'), act.get('weighted_average_watts')),
-        'maxPower': _first(act.get('max_watts'), act.get('maxPower')),
+        'averagePower': avg_p,
+        'normalizedPower': np,
+        'maxPower': max_p,
         'averageSpeed': act.get('average_speed'),
         'maxSpeed': act.get('max_speed'),
         'averageCadence': _first(act.get('average_cadence'), act.get('avg_cadence')),
@@ -241,6 +252,17 @@ def _map_intervals_activity(act: dict) -> dict:
         'intensityFactor': _first(act.get('icu_intensity'), act.get('intensityFactor')),
         'tss': _first(act.get('icu_training_load'), act.get('trainingLoad')),
         'ftpAtTime': act.get('icu_ftp'),
+        # Weight & power-duration model snapshot at the time of the activity —
+        # `icu_weight` lets us compute honest historical W/kg without a separate
+        # weight time-series; `icu_pm_*` are the rider's PM model parameters then.
+        'weightAtTime': weight_at_time,
+        'avgWkg': _wkg(avg_p),
+        'npWkg': _wkg(np),
+        'maxWkg': _wkg(max_p),
+        'pmCpAtTime': act.get('icu_pm_cp'),
+        'pmFtpAtTime': _first(act.get('icu_pm_ftp_watts'), act.get('icu_pm_ftp')),
+        'pmPMaxAtTime': act.get('icu_pm_p_max'),
+        'pmWPrimeAtTime': act.get('icu_pm_w_prime'),
         'activityType': {'typeKey': type_key},
         'rawType': raw_type,
         'deviceName': act.get('device_name'),
@@ -964,6 +986,96 @@ def intervals_get_activity_streams(req: https_fn.CallableRequest) -> dict:
     detail_clean = _sanitize_for_firestore(detail) if detail else {}
 
     return {'status': 'ok', 'detail': detail_clean, 'streams': streams}
+
+
+# Canonical durations for "best efforts" panel: 5s, 15s, 30s, 1min, 5min, 20min, 60min.
+_BEST_EFFORT_SECS = [5, 15, 30, 60, 300, 1200, 3600]
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=60,
+    secrets=[ENCRYPTION_KEY_SECRET],
+)
+def intervals_get_activity_power_curve(req: https_fn.CallableRequest) -> dict:
+    """Fetch the per-activity power-duration curve from intervals.icu.
+
+    Returns:
+      - `curve`: full {secs[], watts[], wkg[]} arrays (167 points typical)
+      - `peaks`: extracted best efforts at canonical durations (5s, 15s, 30s,
+        1min, 5min, 20min, 60min) — each {secs, watts, wkg}
+      - `weight`: kg used for the W/kg calc
+      - `vo2max5m`: VO2max estimate from the 5-min peak
+    """
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+
+    intervals_id = req.data.get('intervalsId')
+    if not intervals_id:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='intervalsId is required',
+        )
+
+    api_key = _get_user_api_key(uid)
+    try:
+        pc = _intervals_request(
+            api_key,
+            f'/activity/{intervals_id}/power-curve',
+            default={},
+        ) or {}
+    except IntervalsAuthError:
+        db.document(f'users/{uid}').set({
+            'intervals': {'needs_reauth': True},
+        }, merge=True)
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='intervals.icu rejected the API key.',
+        )
+
+    secs = pc.get('secs') or []
+    watts = pc.get('watts') or pc.get('values') or []
+    wkg = pc.get('watts_per_kg') or []
+    weight = pc.get('weight')
+
+    peaks = []
+    for target in _BEST_EFFORT_SECS:
+        # Find the smallest curve point with secs >= target (the curve is monotone
+        # in seconds; if no exact match, the next-larger window's value is a safe
+        # over-estimate not used). Falls back to closest if target exceeds range.
+        idx = None
+        for i, s in enumerate(secs):
+            if s >= target:
+                idx = i
+                break
+        if idx is None and secs:
+            idx = len(secs) - 1
+        if idx is None:
+            continue
+        if secs[idx] > target * 1.5:
+            # Activity too short for this duration.
+            continue
+        peak = {
+            'secs': secs[idx],
+            'targetSecs': target,
+            'watts': watts[idx] if idx < len(watts) else None,
+            'wkg': wkg[idx] if idx < len(wkg) else None,
+        }
+        peaks.append(peak)
+
+    return {
+        'status': 'ok',
+        'peaks': peaks,
+        'weight': weight,
+        'vo2max5m': pc.get('vo2max_5m'),
+        # Full curve for callers that want to render the whole MMP plot.
+        'curve': {'secs': secs, 'watts': watts, 'wkg': wkg},
+    }
 
 
 # ══════════════════════════════════════════════════════
@@ -1905,10 +2017,14 @@ PRINCIPLES:
   and treat the file as plural-sport. Do not default to cycling unless they said so.
 - "Current fitness state" — short narrative on CTL (Fitness), ATL (Fatigue), Form
   (TSB), FTP if known, weight; what those numbers mean RIGHT NOW (fresh /
-  accumulating fatigue / peak / detrained). 2-3 sentences max.
+  accumulating fatigue / peak / detrained). 2-3 sentences max. If `profile.wkg`
+  and `profile.cogganTier` are present, include them inline (e.g. "FTP 250 W
+  / 2.85 W/kg — Coggan 'Fair'"). The tier is a coarse percentile band, not a
+  precise grade; treat as guidance, not a grade.
 - "Recent sessions" — 3-6 bullet lines summarising the last week of activities.
   Include sport, duration, character (easy / threshold / VO2 / long). Skip walks
-  under 30 min.
+  under 30 min. For cycling sessions with `avgWkg`/`npWkg`, include W/kg
+  alongside watts (e.g. "1h45 cycling · NP 214w / 2.23 W/kg · IF 0.86").
 - Total under 350 words. Consumed by AI assistants, not humans.
 - No fabrication. Omit a bullet rather than inventing."""
 
@@ -1975,6 +2091,29 @@ def _recent_wellness(uid: str, days: int = 14) -> list:
     return out
 
 
+# Coggan FTP W/kg tiers (must stay in sync with shared.jsx cogganMaleTable / cogganFemaleTable).
+_COGGAN_TIERS_MALE = [
+    ('World Class', 5.83), ('Exceptional', 5.28), ('Excellent', 4.71), ('Very Good', 4.13),
+    ('Good', 3.55), ('Moderate', 3.05), ('Fair', 2.50), ('Untrained', 0.0),
+]
+_COGGAN_TIERS_FEMALE = [
+    ('World Class', 4.65), ('Exceptional', 4.13), ('Excellent', 3.60), ('Very Good', 3.28),
+    ('Good', 2.82), ('Moderate', 2.36), ('Fair', 1.91), ('Untrained', 0.0),
+]
+
+
+def _compute_wkg_and_tier(ftp, weight, gender: str = 'male'):
+    """Return (wkg, tier_label) from FTP (W) + weight (kg). None if either missing."""
+    if not ftp or not weight or weight <= 0:
+        return (None, None)
+    wkg = round(float(ftp) / float(weight), 2)
+    tiers = _COGGAN_TIERS_FEMALE if (gender or '').lower() == 'female' else _COGGAN_TIERS_MALE
+    for label, threshold in tiers:
+        if wkg >= threshold:
+            return (wkg, label)
+    return (wkg, 'Untrained')
+
+
 def _recent_activities_for_compile(uid: str, days: int = 14) -> list:
     """Activities in the last N days, newest first; trimmed for prompt size."""
     cutoff = (date.today() - timedelta(days=days)).isoformat()
@@ -1997,6 +2136,10 @@ def _recent_activities_for_compile(uid: str, days: int = 14) -> list:
             'distanceKm': round((d.get('distance') or 0) / 1000, 1),
             'avgHR': d.get('averageHR'),
             'avgPower': d.get('averagePower'),
+            'normPower': d.get('normalizedPower'),
+            'avgWkg': d.get('avgWkg'),
+            'npWkg': d.get('npWkg'),
+            'weightAtTime': d.get('weightAtTime'),
             'tss': d.get('tss'),
             'intensityFactor': d.get('intensityFactor'),
         })
@@ -2109,15 +2252,22 @@ def _run_compile_training_focus(uid: str, source: str = 'ui') -> dict:
             ],
         }
 
+    ftp_val = profile.get('ftp')
+    weight_val = profile.get('weight')
+    gender_val = (profile.get('gender') or 'male').lower()
+    wkg_val, coggan_tier = _compute_wkg_and_tier(ftp_val, weight_val, gender_val)
+
     payload = {
         'name': name,
         'today': today_iso,
         'profile': {
-            'ftp': profile.get('ftp'),
-            'weight': profile.get('weight'),
+            'ftp': ftp_val,
+            'weight': weight_val,
             'age': profile.get('age'),
             'gender': profile.get('gender'),
             'thresholdHR': profile.get('thresholdHR'),
+            'wkg': wkg_val,
+            'cogganTier': coggan_tier,
         },
         'currentMetrics': {
             'ctl': wellness_today.get('ctl'),

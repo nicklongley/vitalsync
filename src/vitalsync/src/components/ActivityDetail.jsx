@@ -16,6 +16,13 @@ import { useIntervalsSync } from '@/hooks/useIntervalsData';
 // Stable reference — calling httpsCallable directly avoids the render loop
 // that hook-returned closures cause when used as effect dependencies.
 const fetchStreamsFn = httpsCallable(functions, 'intervals_get_activity_streams');
+const fetchPowerCurveFn = httpsCallable(functions, 'intervals_get_activity_power_curve');
+
+function formatBestEffortDuration(secs) {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.round(secs / 60)}min`;
+  return `${Math.round(secs / 3600)}h`;
+}
 
 const SPORT_ICONS = {
   running: '🏃', trail_running: '🏃', treadmill_running: '🏃', track_running: '🏃',
@@ -109,6 +116,29 @@ export default function ActivityDetail({ activityId, onBack }) {
       });
     return () => { cancelled = true; };
   }, [intervalsId, connected]);
+
+  // Lazy-load power curve (peaks at canonical durations) for the Best Efforts panel.
+  const [powerCurve, setPowerCurve] = useState(null);
+  const [powerCurveLoading, setPowerCurveLoading] = useState(false);
+  const hasPowerData = !!(activity?.averagePower || activity?.normalizedPower);
+  useEffect(() => {
+    if (!intervalsId || !connected || !hasPowerData) return;
+    let cancelled = false;
+    setPowerCurveLoading(true);
+    fetchPowerCurveFn({ intervalsId })
+      .then((res) => {
+        if (cancelled) return;
+        setPowerCurve(res?.data || null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.error('Power curve fetch failed:', err);
+      })
+      .finally(() => {
+        if (!cancelled) setPowerCurveLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [intervalsId, connected, hasPowerData]);
 
   // Compute peaks from streams as a reliable fallback when detail-endpoint maxes are missing.
   const streamPeaks = useMemo(() => {
@@ -221,9 +251,21 @@ export default function ActivityDetail({ activityId, onBack }) {
         <Stat label="Elevation" value={display.elevationGain ? `${Math.round(display.elevationGain)} m` : '--'} />
         {(display.averagePower || display.normalizedPower || display.maxPower) && (
           <>
-            <Stat label="Avg Power" value={display.averagePower ? `${Math.round(display.averagePower)} W` : '--'} />
-            <Stat label="Norm. Power" value={display.normalizedPower ? `${Math.round(display.normalizedPower)} W` : '--'} />
-            <Stat label="Max Power" value={display.maxPower ? `${Math.round(display.maxPower)} W` : '--'} />
+            <Stat
+              label="Avg Power"
+              value={display.averagePower ? `${Math.round(display.averagePower)} W` : '--'}
+              sub={display.avgWkg ? `${display.avgWkg.toFixed(2)} W/kg` : null}
+            />
+            <Stat
+              label="Norm. Power"
+              value={display.normalizedPower ? `${Math.round(display.normalizedPower)} W` : '--'}
+              sub={display.npWkg ? `${display.npWkg.toFixed(2)} W/kg` : null}
+            />
+            <Stat
+              label="Max Power"
+              value={display.maxPower ? `${Math.round(display.maxPower)} W` : '--'}
+              sub={display.maxWkg ? `${display.maxWkg.toFixed(2)} W/kg` : null}
+            />
           </>
         )}
         <Stat label="Avg HR" value={display.averageHR ? `${Math.round(display.averageHR)} bpm` : '--'} />
@@ -237,6 +279,30 @@ export default function ActivityDetail({ activityId, onBack }) {
           </>
         )}
       </div>
+
+      {/* Best Efforts panel — peak watts + W/kg at canonical durations */}
+      {connected && hasPowerData && (
+        <div className="glass-card p-4">
+          <p className="text-xs text-slate-400 uppercase tracking-wider mb-2">Best Efforts</p>
+          {powerCurveLoading ? (
+            <div className="h-14 flex items-center justify-center">
+              <div className="w-5 h-5 rounded-full border-2 border-cyan-500 border-t-transparent animate-spin" />
+            </div>
+          ) : !powerCurve?.peaks?.length ? (
+            <p className="text-xs text-slate-500 py-2">No peak data available.</p>
+          ) : (
+            <div className="grid grid-cols-7 gap-1">
+              {powerCurve.peaks.map((p) => (
+                <div key={p.targetSecs} className="text-center">
+                  <p className="text-[9px] text-slate-500 uppercase">{formatBestEffortDuration(p.targetSecs)}</p>
+                  <p className="text-sm font-mono font-bold text-white mt-0.5">{Math.round(p.watts || 0)}<span className="text-[9px] text-slate-500 ml-0.5">w</span></p>
+                  <p className="text-[10px] text-cyan-400 font-mono">{p.wkg ? p.wkg.toFixed(2) : '--'}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Streams chart */}
       {connected && (
@@ -308,6 +374,15 @@ function mergeDetail(activity, detail, streamPeaks = {}) {
   const kj = d.kilojoules;
   const calories = d.calories
     ?? (kj ? Math.round(kj / 4.184) : (joules ? Math.round(joules / 4184) : activity.calories));
+
+  const averagePower = pick(d.average_watts, d.icu_average_watts, activity.averagePower);
+  const normalizedPower = pick(d.icu_weighted_avg_watts, d.weighted_average_watts, activity.normalizedPower);
+  const maxPower = pick(streamPeaks.maxPower, d.max_watts, d.icu_max_watts, activity.maxPower);
+  // Derive W/kg on the fly when persisted fields are absent (pre-backfill activities)
+  // — falls back to the fresh detail's `icu_weight` so the number is still honest.
+  const weightAtTime = pick(activity.weightAtTime, d.icu_weight);
+  const wkg = (p) => (p && weightAtTime ? Math.round((p / weightAtTime) * 100) / 100 : null);
+
   return {
     ...activity,
     activityName: pick(d.name, activity.activityName),
@@ -320,9 +395,13 @@ function mergeDetail(activity, detail, streamPeaks = {}) {
     calories,
     averageHR: pick(d.average_heartrate, d.icu_average_heartrate, activity.averageHR),
     maxHR: pick(streamPeaks.maxHR, d.max_heartrate, d.icu_max_heartrate, activity.maxHR),
-    averagePower: pick(d.average_watts, d.icu_average_watts, activity.averagePower),
-    normalizedPower: pick(d.icu_weighted_avg_watts, d.weighted_average_watts, activity.normalizedPower),
-    maxPower: pick(streamPeaks.maxPower, d.max_watts, d.icu_max_watts, activity.maxPower),
+    averagePower,
+    normalizedPower,
+    maxPower,
+    weightAtTime,
+    avgWkg: activity.avgWkg ?? wkg(averagePower),
+    npWkg: activity.npWkg ?? wkg(normalizedPower),
+    maxWkg: activity.maxWkg ?? wkg(maxPower),
     averageCadence: pick(d.average_cadence, activity.averageCadence),
     averageSpeed: pick(d.average_speed, activity.averageSpeed),
     maxSpeed: pick(d.max_speed, activity.maxSpeed),
@@ -333,11 +412,12 @@ function mergeDetail(activity, detail, streamPeaks = {}) {
   };
 }
 
-function Stat({ label, value }) {
+function Stat({ label, value, sub }) {
   return (
     <div className="glass-card p-3">
       <p className="text-[10px] text-slate-500 uppercase tracking-wider">{label}</p>
       <p className="text-sm font-mono font-semibold text-white mt-1">{value}</p>
+      {sub && <p className="text-[10px] text-cyan-400 font-mono mt-0.5">{sub}</p>}
     </div>
   );
 }
