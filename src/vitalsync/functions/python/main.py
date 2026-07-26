@@ -23,9 +23,10 @@ db = firestore.client()
 REGION = options.SupportedRegion.EUROPE_WEST2
 
 # ── Secrets ──
-# Reuses the existing GARMIN_ENCRYPTION_KEY secret to avoid manual rotation.
-# Now used to encrypt the user's intervals.icu API key at rest.
-ENCRYPTION_KEY_SECRET = options.SecretParam('GARMIN_ENCRYPTION_KEY')
+# Encrypts the user's intervals.icu API key at rest. Value is identical to the
+# former GARMIN_ENCRYPTION_KEY secret (copied on rename), so existing ciphertexts
+# still decrypt; the old secret is retained in Secret Manager for rollback.
+ENCRYPTION_KEY_SECRET = options.SecretParam('INTERVALS_ENCRYPTION_KEY')
 
 
 # ══════════════════════════════════════════════════════
@@ -33,9 +34,9 @@ ENCRYPTION_KEY_SECRET = options.SecretParam('GARMIN_ENCRYPTION_KEY')
 # ══════════════════════════════════════════════════════
 
 def _get_encryption_key() -> bytes:
-    key_hex = os.environ.get('GARMIN_ENCRYPTION_KEY', '')
+    key_hex = os.environ.get('INTERVALS_ENCRYPTION_KEY', '')
     if not key_hex:
-        raise ValueError('GARMIN_ENCRYPTION_KEY not set — configure via Secret Manager')
+        raise ValueError('INTERVALS_ENCRYPTION_KEY not set — configure via Secret Manager')
     return bytes.fromhex(key_hex)
 
 
@@ -252,6 +253,11 @@ def _map_intervals_activity(act: dict) -> dict:
         'intensityFactor': _first(act.get('icu_intensity'), act.get('intensityFactor')),
         'tss': _first(act.get('icu_training_load'), act.get('trainingLoad')),
         'ftpAtTime': act.get('icu_ftp'),
+        # eFTP: intervals.icu's rolling estimated FTP (icu_rolling_ftp), derived from
+        # recent power curves and present on the activities LIST endpoint. Falls back to
+        # the per-ride power-model FTP (detail-only). Set FTP can drift stale; a
+        # materially higher/lower eFTP is the signal that surfaces it.
+        'eftp': _first(act.get('icu_rolling_ftp'), act.get('icu_pm_ftp_watts')),
         # Weight & power-duration model snapshot at the time of the activity —
         # `icu_weight` lets us compute honest historical W/kg without a separate
         # weight time-series; `icu_pm_*` are the rider's PM model parameters then.
@@ -272,6 +278,162 @@ def _map_intervals_activity(act: dict) -> dict:
         'fileType': act.get('file_type'),
         'source': 'intervals',
     }
+
+
+# Canonical durations for the "best efforts" panel: 5s, 15s, 30s, 1min, 5min, 20min, 60min.
+_BEST_EFFORT_SECS = [5, 15, 30, 60, 300, 1200, 3600]
+
+
+def _extract_canonical_peaks(pc: dict):
+    """From an intervals.icu power-curve payload, pull the best effort at each
+    canonical duration. Returns (peaks_list, peaks_map):
+      - peaks_list: [{secs, targetSecs, watts, wkg}] — the power-curve callable's shape
+      - peaks_map:  {'1200': {'w', 'wkg'}, ...} — compact form persisted on the activity
+    The curve is monotone in seconds; for each target we take the first point whose
+    window is >= target, skipping durations the ride was too short to cover.
+    """
+    secs = pc.get('secs') or []
+    watts = pc.get('watts') or pc.get('values') or []
+    wkg = pc.get('watts_per_kg') or []
+    peaks_list = []
+    peaks_map = {}
+    for target in _BEST_EFFORT_SECS:
+        idx = None
+        for i, s in enumerate(secs):
+            if s >= target:
+                idx = i
+                break
+        if idx is None and secs:
+            idx = len(secs) - 1
+        if idx is None:
+            continue
+        if secs[idx] > target * 1.5:
+            # Activity too short for this duration.
+            continue
+        w = watts[idx] if idx < len(watts) else None
+        wk = wkg[idx] if idx < len(wkg) else None
+        peaks_list.append({'secs': secs[idx], 'targetSecs': target, 'watts': w, 'wkg': wk})
+        peaks_map[str(target)] = {'w': w, 'wkg': wk}
+    return peaks_list, peaks_map
+
+
+def _fetch_activity_peaks(api_key: str, intervals_id) -> tuple:
+    """Fetch one activity's power-duration curve and extract its canonical peaks.
+    Returns (peaks_map, fetched) where `fetched` is True only when the curve call
+    actually returned data — so callers can mark the activity done even when it was
+    too short to have every peak, but retry on rate-limit / transient failure.
+    Raises IntervalsAuthError on a rejected key.
+    """
+    pc = _intervals_request(api_key, f'/activity/{intervals_id}/power-curve', default=None)
+    if not pc:
+        return {}, False
+    _, peaks_map = _extract_canonical_peaks(pc)
+    return peaks_map, True
+
+
+# Durability: the freshest-window peak that _extract_canonical_peaks returns always
+# comes from the least-fatigued part of a ride. Fatigue resistance is what you can
+# still do deep into a ride — best 20-min power after 1,000 kJ of work. Two riders
+# with identical fresh 20-min can differ hugely here, and this is the number that
+# actually tracks the endurance base you're trying to build.
+_DURABILITY_KJ = 1000
+_DURABILITY_WINDOW_SECS = 1200  # 20 min
+
+
+def _best_avg_after_kj(watts, weight, kj_threshold=_DURABILITY_KJ, window=_DURABILITY_WINDOW_SECS):
+    """Best `window`-second average power occurring entirely AFTER cumulative work
+    passes `kj_threshold`. Assumes 1 Hz watts samples (intervals.icu's fixed stream).
+    Returns {kJThreshold, windowSecs, w, wkg} or None if the ride never reaches the
+    threshold with a full window of riding left."""
+    if not watts:
+        return None
+    cum_kj = 0.0
+    start_idx = None
+    for i, w in enumerate(watts):
+        cum_kj += (w or 0) / 1000.0  # 1 s per sample → W == J/s, /1000 → kJ
+        if cum_kj >= kj_threshold:
+            start_idx = i
+            break
+    if start_idx is None:
+        return None
+    n = len(watts)
+    if n - start_idx < window:
+        return None  # not enough riding after the threshold for a full window
+    cur = sum((watts[j] or 0) for j in range(start_idx, start_idx + window))
+    best = cur
+    for i in range(start_idx + window, n):
+        cur += (watts[i] or 0) - (watts[i - window] or 0)
+        if cur > best:
+            best = cur
+    best_avg = best / window
+    out = {'kJThreshold': kj_threshold, 'windowSecs': window, 'w': round(best_avg)}
+    if weight and weight > 0:
+        out['wkg'] = round(best_avg / weight, 2)
+    return out
+
+
+def _fetch_activity_durability(api_key: str, intervals_id, weight):
+    """Fetch the watts stream and compute best 20-min power after 1,000 kJ. Returns
+    the durability dict, or None (ride too short / not enough work / no stream).
+    Raises IntervalsAuthError on a rejected key; swallows transient stream errors."""
+    try:
+        result = _intervals_request(
+            api_key,
+            f'/activity/{intervals_id}/streams',
+            params={'types': 'watts'},
+            default=None,
+        )
+    except IntervalsAuthError:
+        raise
+    except Exception as e:
+        print(f'durability stream fetch failed for {intervals_id}: {e}')
+        return None
+    watts = None
+    if isinstance(result, list):
+        for stream in result:
+            if isinstance(stream, dict) and stream.get('type') == 'watts':
+                watts = stream.get('data')
+                break
+    if not isinstance(watts, list) or not watts:
+        return None
+    return _best_avg_after_kj(watts, weight)
+
+
+def _total_kj(act: dict):
+    """Total mechanical work (kJ) for a ride, from whichever energy field is present."""
+    if act.get('icu_joules'):
+        return act['icu_joules'] / 1000.0
+    if act.get('kilojoules'):
+        return act['kilojoules']
+    return None
+
+
+def _enrich_activity_power(api_key: str, act: dict, mapped: dict) -> bool:
+    """Populate mapped['peaks'] (full canonical curve) and mapped['durability20min']
+    (best 20-min after 1,000 kJ) from intervals.icu. `act` is the raw activity (for
+    total-work and weight), `mapped` is the doc being written. Returns True when the
+    power-curve fetch succeeded — the caller stamps peaksFetchedAt so we don't re-hit
+    these endpoints on every re-processed sync. Never raises for transient errors."""
+    act_id = act.get('id')
+    fetched = False
+    try:
+        peaks_map, ok = _fetch_activity_peaks(api_key, act_id)
+        if ok:
+            mapped['peaks'] = peaks_map
+            fetched = True
+    except Exception as e:
+        print(f'peaks fetch failed for intervals_{act_id}: {e}')
+    # Durability only exists for rides long enough to have a post-1,000 kJ window;
+    # gate the (heavier) watts-stream fetch on total work to skip short rides.
+    total_kj = _total_kj(act)
+    if total_kj and total_kj >= _DURABILITY_KJ:
+        try:
+            dur = _fetch_activity_durability(api_key, act_id, act.get('icu_weight'))
+            if dur:
+                mapped['durability20min'] = dur
+        except Exception as e:
+            print(f'durability calc failed for intervals_{act_id}: {e}')
+    return fetched
 
 
 # ══════════════════════════════════════════════════════
@@ -542,8 +704,21 @@ def _do_intervals_sync(uid: str, api_key: str, start_date: str, end_date: str = 
         try:
             mapped = _map_intervals_activity(act)
             ref = db.document(f'users/{uid}/activities/intervals_{act_id}')
+            # Lazily persist per-session best-effort peaks (5s…60min) for rides
+            # with power, once each — so the helper API / compile can surface e.g.
+            # best 20-min power without re-fetching the power-duration curve on
+            # every sync. Guarded by peaksFetchedAt so re-processed recent days
+            # don't re-hit the curve endpoint.
+            fetched_peaks = False
+            if mapped.get('averagePower'):
+                existing = ref.get()
+                already = existing.exists and (existing.to_dict() or {}).get('peaksFetchedAt')
+                if not already:
+                    fetched_peaks = _enrich_activity_power(api_key, act, mapped)
             clean = _sanitize_for_firestore(mapped)
             clean['processedAt'] = firestore.SERVER_TIMESTAMP
+            if fetched_peaks:
+                clean['peaksFetchedAt'] = firestore.SERVER_TIMESTAMP
             batch.set(ref, clean, merge=True)
             write_count += 1
             if write_count >= 450:
@@ -988,10 +1163,6 @@ def intervals_get_activity_streams(req: https_fn.CallableRequest) -> dict:
     return {'status': 'ok', 'detail': detail_clean, 'streams': streams}
 
 
-# Canonical durations for "best efforts" panel: 5s, 15s, 30s, 1min, 5min, 20min, 60min.
-_BEST_EFFORT_SECS = [5, 15, 30, 60, 300, 1200, 3600]
-
-
 @https_fn.on_call(
     region=REGION,
     memory=options.MemoryOption.MB_512,
@@ -1043,30 +1214,7 @@ def intervals_get_activity_power_curve(req: https_fn.CallableRequest) -> dict:
     wkg = pc.get('watts_per_kg') or []
     weight = pc.get('weight')
 
-    peaks = []
-    for target in _BEST_EFFORT_SECS:
-        # Find the smallest curve point with secs >= target (the curve is monotone
-        # in seconds; if no exact match, the next-larger window's value is a safe
-        # over-estimate not used). Falls back to closest if target exceeds range.
-        idx = None
-        for i, s in enumerate(secs):
-            if s >= target:
-                idx = i
-                break
-        if idx is None and secs:
-            idx = len(secs) - 1
-        if idx is None:
-            continue
-        if secs[idx] > target * 1.5:
-            # Activity too short for this duration.
-            continue
-        peak = {
-            'secs': secs[idx],
-            'targetSecs': target,
-            'watts': watts[idx] if idx < len(watts) else None,
-            'wkg': wkg[idx] if idx < len(wkg) else None,
-        }
-        peaks.append(peak)
+    peaks, _ = _extract_canonical_peaks(pc)
 
     return {
         'status': 'ok',
@@ -1076,6 +1224,71 @@ def intervals_get_activity_power_curve(req: https_fn.CallableRequest) -> dict:
         # Full curve for callers that want to render the whole MMP plot.
         'curve': {'secs': secs, 'watts': watts, 'wkg': wkg},
     }
+
+
+@https_fn.on_call(
+    region=REGION,
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=540,
+    secrets=[ENCRYPTION_KEY_SECRET],
+)
+def intervals_backfill_peaks(req: https_fn.CallableRequest) -> dict:
+    """One-off: populate `peaks` + `durability20min` for historical rides that predate
+    sync-time enrichment — so the metrics are a nine-month progression series, not just
+    a starting point. Iterates existing power activities missing `peaksFetchedAt`,
+    newest first, fetching each one's power curve (+ watts stream for long rides).
+    Processes up to `limit` per call (default 100, cap 200) to stay within timeout;
+    call again while `remaining` > 0. Idempotent — already-enriched rides are skipped.
+    """
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='Must be signed in',
+        )
+    uid = req.auth.uid
+    limit = min(int(req.data.get('limit') or 100), 200)
+    api_key = _get_user_api_key(uid)
+
+    # order_by alone uses the automatic single-field index (a where('source',...) +
+    # order_by on another field would need a composite index); filter power + missing
+    # peaks in Python since Firestore can't query for an absent field.
+    q = (
+        db.collection(f'users/{uid}/activities')
+        .order_by('startTimeLocal', direction='DESCENDING')
+    )
+    processed = 0
+    updated = 0
+    remaining = 0
+    for doc_snap in q.stream():
+        d = doc_snap.to_dict() or {}
+        if not d.get('averagePower') or d.get('peaksFetchedAt'):
+            continue
+        if processed >= limit:
+            remaining += 1
+            continue
+        processed += 1
+        intervals_id = d.get('intervalsId')
+        if not intervals_id:
+            continue
+        # Reconstruct the minimal raw-activity fields _enrich_activity_power needs.
+        # kJ is only used to gate the durability stream fetch; kcal→kJ is close enough.
+        cal = d.get('calories')
+        act = {
+            'id': intervals_id,
+            'icu_weight': d.get('weightAtTime'),
+            'kilojoules': (cal * 4.184) if cal else None,
+        }
+        mapped = {}
+        fetched = _enrich_activity_power(api_key, act, mapped)
+        clean = _sanitize_for_firestore(mapped) if mapped else {}
+        if fetched:
+            clean['peaksFetchedAt'] = firestore.SERVER_TIMESTAMP
+            updated += 1
+        if clean:
+            doc_snap.reference.set(clean, merge=True)
+
+    print(f'intervals peaks backfill {uid}: processed {processed}, updated {updated}, remaining {remaining}')
+    return {'status': 'ok', 'processed': processed, 'updated': updated, 'remaining': remaining}
 
 
 # ══════════════════════════════════════════════════════
@@ -2020,11 +2233,19 @@ PRINCIPLES:
   accumulating fatigue / peak / detrained). 2-3 sentences max. If `profile.wkg`
   and `profile.cogganTier` are present, include them inline (e.g. "FTP 250 W
   / 2.85 W/kg — Coggan 'Fair'"). The tier is a coarse percentile band, not a
-  precise grade; treat as guidance, not a grade.
+  precise grade; treat as guidance, not a grade. If `profile.eftp` is present and
+  differs materially (>~5%) from the set `profile.ftp`, flag it explicitly — a
+  curve-derived eFTP well above the set FTP means the set value is stale and the
+  W/kg/tier above understate the rider (e.g. "set FTP 250 W but eFTP 285 W —
+  set value looks stale").
 - "Recent sessions" — 3-6 bullet lines summarising the last week of activities.
   Include sport, duration, character (easy / threshold / VO2 / long). Skip walks
   under 30 min. For cycling sessions with `avgWkg`/`npWkg`, include W/kg
-  alongside watts (e.g. "1h45 cycling · NP 214w / 2.23 W/kg · IF 0.86").
+  alongside watts (e.g. "1h45 cycling · NP 214w / 2.23 W/kg · IF 0.86"). When a
+  session's `peaks` show a standout effort, name it by system (p5min = VO2,
+  p1min = anaerobic, p20min = threshold). When `durability20minW` is present it is
+  the best 20-min AFTER 1,000 kJ — call it out versus the fresh p20min, since the
+  gap is the rider's fatigue resistance and matters more than either number alone.
 - Total under 350 words. Consumed by AI assistants, not humans.
 - No fabrication. Omit a bullet rather than inventing."""
 
@@ -2114,6 +2335,22 @@ def _compute_wkg_and_tier(ftp, weight, gender: str = 'male'):
     return (wkg, 'Untrained')
 
 
+def _compile_peaks(peaks) -> dict | None:
+    """Compact best-effort peaks for the compile payload, keyed by the durations that
+    separate physiological systems: 5s neuromuscular, 1min anaerobic, 5min VO2, 20min
+    threshold, 60min endurance. Surfacing more than 20min alone lets the model tell
+    top-end from threshold — they move independently and imply different training."""
+    if not isinstance(peaks, dict):
+        return None
+    labels = {'5': 'p5s', '60': 'p1min', '300': 'p5min', '1200': 'p20min', '3600': 'p60min'}
+    out = {}
+    for secs, label in labels.items():
+        p = peaks.get(secs)
+        if isinstance(p, dict) and p.get('w'):
+            out[label] = {'w': p['w'], 'wkg': p.get('wkg')}
+    return out or None
+
+
 def _recent_activities_for_compile(uid: str, days: int = 14) -> list:
     """Activities in the last N days, newest first; trimmed for prompt size."""
     cutoff = (date.today() - timedelta(days=days)).isoformat()
@@ -2142,6 +2379,12 @@ def _recent_activities_for_compile(uid: str, days: int = 14) -> list:
             'weightAtTime': d.get('weightAtTime'),
             'tss': d.get('tss'),
             'intensityFactor': d.get('intensityFactor'),
+            'eftp': d.get('eftp'),
+            # Fresh best efforts across durations (top-end → threshold → endurance).
+            'peaks': _compile_peaks(d.get('peaks')),
+            # Fatigue resistance: best 20-min after 1,000 kJ (null on shorter rides).
+            'durability20minW': (d.get('durability20min') or {}).get('w'),
+            'durability20minWkg': (d.get('durability20min') or {}).get('wkg'),
         })
     return out
 
@@ -2164,10 +2407,13 @@ def _name_for(uid: str) -> str:
 
 
 def _persist_ai_context_file(uid: str, file_id: str, domain: str, kind: str,
-                              content: str, source: str = 'ui') -> str | None:
+                              content: str, source: str = 'ui',
+                              generated_by: str = 'claude-sonnet-4-5-20250929') -> str | None:
     """Write a freshly-compiled file. Captures the prior content into
     previousContent so the helper API can compute section-level diffs on the
     next read. Returns the prior content (or None if first compile).
+    `generated_by` is the model/producer id — pass a non-LLM producer for
+    deterministic rollups so the metadata is honest.
     """
     ref = db.document(f'users/{uid}/aiContext/{file_id}')
     snap = ref.get()
@@ -2179,7 +2425,7 @@ def _persist_ai_context_file(uid: str, file_id: str, domain: str, kind: str,
         'content': content,
         'previousContent': previous,
         'generatedAt': firestore.SERVER_TIMESTAMP,
-        'generatedBy': 'claude-sonnet-4-5-20250929',
+        'generatedBy': generated_by,
         'compileSource': source,
     }, merge=True)
     return previous
@@ -2256,12 +2502,16 @@ def _run_compile_training_focus(uid: str, source: str = 'ui') -> dict:
     weight_val = profile.get('weight')
     gender_val = (profile.get('gender') or 'male').lower()
     wkg_val, coggan_tier = _compute_wkg_and_tier(ftp_val, weight_val, gender_val)
+    # Most recent intervals.icu eFTP across recent rides — a curve-derived cross-check
+    # on the manually-set FTP; a large gap means the set FTP is stale.
+    eftp_recent = next((a.get('eftp') for a in activities if a.get('eftp')), None)
 
     payload = {
         'name': name,
         'today': today_iso,
         'profile': {
             'ftp': ftp_val,
+            'eftp': eftp_recent,
             'weight': weight_val,
             'age': profile.get('age'),
             'gender': profile.get('gender'),
@@ -2943,6 +3193,102 @@ def data_export(req: https_fn.CallableRequest) -> dict:
 
 
 # ══════════════════════════════════════════════════════
+# TRAINING.POWER — deterministic monthly power progression
+# ══════════════════════════════════════════════════════
+
+# Durations surfaced in the progression table, in physiological order.
+_POWER_PROGRESSION_DURATIONS = [
+    ('5', '5s'), ('60', '1min'), ('300', '5min'), ('1200', '20min'), ('3600', '60min'),
+]
+
+
+def _run_compile_training_power(uid: str, source: str = 'ui') -> dict:
+    """Compile training.power.md — a monthly best-power progression built directly from
+    the persisted per-activity `peaks` + `durability20min`. Deterministic (NO LLM): a
+    factual rollup that gives the helper the nine-month trend the recent-window
+    training.focus file can't. Returns {content, previous}."""
+    name = _name_for(uid)
+    profile = (db.document(f'users/{uid}').get().to_dict() or {}).get('profile') or {}
+    set_ftp = profile.get('ftp')
+
+    # month 'YYYY-MM' -> {'peaks': {secs: {w,wkg}}, 'dur': {w,wkg}|None, 'eftp': float|None}
+    months: dict = {}
+    for snap in db.collection(f'users/{uid}/activities').stream():
+        d = snap.to_dict() or {}
+        peaks = d.get('peaks')
+        dur = d.get('durability20min')
+        eftp = d.get('eftp')
+        if not peaks and not dur and not eftp:
+            continue
+        mo = (d.get('startTimeLocal') or '')[:7]
+        if not mo:
+            continue
+        m = months.setdefault(mo, {'peaks': {}, 'dur': None, 'eftp': None})
+        if isinstance(peaks, dict):
+            for secs, _label in _POWER_PROGRESSION_DURATIONS:
+                p = peaks.get(secs)
+                if not isinstance(p, dict):
+                    continue
+                cell = m['peaks'].setdefault(secs, {'w': None, 'wkg': None})
+                if p.get('w') and (cell['w'] is None or p['w'] > cell['w']):
+                    cell['w'] = p['w']
+                if p.get('wkg') and (cell['wkg'] is None or p['wkg'] > cell['wkg']):
+                    cell['wkg'] = p['wkg']
+        if isinstance(dur, dict) and dur.get('w'):
+            cur = m['dur'] or {'w': None, 'wkg': None}
+            if cur['w'] is None or dur['w'] > cur['w']:
+                cur['w'] = dur['w']
+            if dur.get('wkg') and (cur['wkg'] is None or dur['wkg'] > cur['wkg']):
+                cur['wkg'] = dur['wkg']
+            m['dur'] = cur
+        if eftp and (m['eftp'] is None or eftp > m['eftp']):
+            m['eftp'] = eftp
+
+    def _cell(c) -> str:
+        if not c or not c.get('w'):
+            return '—'
+        w = round(c['w'])
+        return f'{w} · {c["wkg"]:.1f}' if c.get('wkg') else str(w)
+
+    ordered = sorted(months.keys(), reverse=True)
+    latest_eftp = next((months[mo]['eftp'] for mo in ordered if months[mo]['eftp']), None)
+
+    lines = [f'# Power Progression: {name}', '']
+    lines.append('Monthly best efforts (watts · W/kg), newest first. Peaks are FRESH — the '
+                 'least-fatigued window in a ride. Durability = best 20-min AFTER 1,000 kJ; '
+                 'the gap between it and the fresh 20-min is fatigue resistance.')
+    if set_ftp or latest_eftp:
+        bits = []
+        if set_ftp:
+            bits.append(f'Set FTP (profile): {round(set_ftp)} W')
+        if latest_eftp:
+            bits.append(f'latest eFTP: {round(latest_eftp)} W')
+        lines += ['', ' · '.join(bits) + '.']
+    lines += ['', '## Monthly bests', '']
+
+    labels = [lbl for _s, lbl in _POWER_PROGRESSION_DURATIONS]
+    lines.append('| Month | eFTP | ' + ' | '.join(labels) + ' | Dur 20min |')
+    lines.append('|' + '---|' * (len(labels) + 3))
+    for mo in ordered:
+        m = months[mo]
+        row = [mo, (str(round(m['eftp'])) if m['eftp'] else '—')]
+        row += [_cell(m['peaks'].get(secs)) for secs, _l in _POWER_PROGRESSION_DURATIONS]
+        row.append(_cell(m['dur']))
+        lines.append('| ' + ' | '.join(row) + ' |')
+
+    if not ordered:
+        lines.append('| — | — | — | — | — | — | — | — |')
+        lines += ['', '_No power data yet — sync a power-meter ride or run the peaks backfill._']
+
+    content = '\n'.join(lines).rstrip() + '\n'
+    previous = _persist_ai_context_file(
+        uid, 'training_power', 'training', 'power', content,
+        source=source, generated_by='vitalsync-rollup',
+    )
+    return {'content': content, 'previous': previous}
+
+
+# ══════════════════════════════════════════════════════
 # HELPER API — bearer-auth REST endpoints for the local helper agent
 # Batched read of training/health .me/.focus markdown files with optional
 # fresh recompile and per-file freshness/diff metadata.
@@ -2954,6 +3300,7 @@ import secrets
 _HELPER_API_FILES = {
     'training.focus': ('training', 'focus', _run_compile_training_focus),
     'training.me':    ('training', 'me',    _run_compile_training_me),
+    'training.power': ('training', 'power', _run_compile_training_power),
     'health.focus':   ('health',   'focus', _run_compile_health_focus),
     'health.me':      ('health',   'me',    _run_compile_health_me),
 }
@@ -3018,6 +3365,7 @@ def _parse_header_and_sections(content: str):
 _STALE_THRESHOLDS_SEC = {
     'focus': 6 * 3600,   # 6h for focus files
     'me':    24 * 3600,  # 24h for me files
+    'power': 24 * 3600,  # 24h for the progression rollup (also recompiles on new sync)
 }
 
 

@@ -72,7 +72,7 @@
   "functions": [
     {
       "source": "functions/python",
-      "codebase": "garmin-sync",
+      "codebase": "intervals-sync",
       "runtime": "python312",
       "ignore": ["venv", "__pycache__", ".git", "*.pyc"]
     }

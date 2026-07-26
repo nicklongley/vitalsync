@@ -96,7 +96,7 @@ python3 -c "import os; print(os.urandom(32).hex())"
 # Copy the output
 
 # Set the secret
-firebase functions:secrets:set GARMIN_ENCRYPTION_KEY
+firebase functions:secrets:set INTERVALS_ENCRYPTION_KEY
 # Paste the hex key when prompted
 ```
 
